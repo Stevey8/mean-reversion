@@ -19,6 +19,8 @@ import logging # for future logging on cloud
 from datetime import date, datetime, timedelta
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from tabulate import tabulate
+
 
 # -----
 
@@ -96,6 +98,16 @@ def build_dict(ticker, end_date = None):
         'cagr': get_cagr(df_trade),
         'sharpe': get_sharpe(df_trade, total_trading_days)
     }
+    # trade states:
+        # 'exit_reason_spread'
+        # 'holding_days_spread'
+        # 'total_trading_days'
+        # 'total_holding_days'
+        # 'holding_time_percentage'
+        # 'n_trades'
+        # 'n_wins'
+        # 'win_rate'
+
     print('backtesting done. now train the final model...')
     # train the final model on all data
     final_model = train_with_best_param(X, y, drop_feats, fitted_train)
@@ -163,6 +175,7 @@ def update_dfs(
     save_dfs(dfs)
     return dfs
 
+    
 
 # -----
 
@@ -220,3 +233,53 @@ def run_pred(ticker, model = None, start_date = None, end_date = None):
     }
 
     return pd.DataFrame(my_d, index=data_to_pred.index)
+
+
+# -----
+
+def check_backtest_metrics(dfs=None, load_existing=True, sort_by = None):
+    if load_existing:
+        dfs = load_dfs()
+    else:
+        dfs = dfs
+    
+    my_d = {}
+    for k,v in dfs.items():
+        if k=='metadata':
+            continue
+        my_d[k] = {
+            'total_trading_days': v['test_set_result']['total_trading_days'],
+            'holding_time_percentage': v['test_set_result']['holding_time_percentage'],
+            'n_trades': v['test_set_result']['n_trades'],
+            'win_rate': v['test_set_result']['win_rate'],
+            'cagr': v['test_set_result']['cagr'],
+            'sharpe': v['test_set_result']['sharpe'],
+        }
+
+
+    if len(my_d) == 0:
+        print('empyt dfs')
+        return None
+
+    allowed_keys = list(next(iter(my_d.values())).keys())
+    allowed_keys = allowed_keys + ['ticker', None]
+
+    if sort_by not in allowed_keys:
+        print(f"ERROR: sort_by must be None or one of: {allowed_keys}")
+        return None
+    
+    df = pd.DataFrame.from_dict(my_d, orient='index')
+    if sort_by == 'ticker':
+        df = df.sort_index(ascending=True)
+    elif sort_by is not None:
+        df = df.sort_values(by=sort_by, ascending=False)
+    
+    df_display = df.copy()
+
+    df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
+    df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
+    df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
+    df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
+
+    print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
+    return None

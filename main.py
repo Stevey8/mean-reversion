@@ -1,4 +1,4 @@
-from production import load_dfs, save_dfs, update_dfs, run_pred
+from production import load_dfs, save_dfs, update_dfs, run_pred, check_backtest_metrics
 from config import watchlist
 
 import pandas as pd
@@ -17,7 +17,8 @@ globals().update({
     'load_dfs': load_dfs,
     'save_dfs': save_dfs,
     'update_dfs': update_dfs,
-    'run_pred': run_pred
+    'run_pred': run_pred, 
+    'check_backtest_metrics': check_backtest_metrics
 })
 
 os.makedirs("predictions", exist_ok=True)
