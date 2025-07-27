@@ -1,17 +1,9 @@
-import os
-from datetime import datetime, timedelta 
-import time
 import pandas as pd 
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import yfinance as yf
-from scipy.signal import argrelextrema
-from scipy.special import ndtr
-import ta
-from arch import arch_model
 
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, train_test_split, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV, train_test_split, TimeSeriesSplit
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
@@ -40,7 +32,8 @@ def get_pipeline(drop_feats):
             objective='binary:logistic',
             eval_metric='logloss',
             use_label_encoder=False,
-            random_state=42
+            random_state=42,
+            verbosity=0
         ))
     ])
     return pipe
@@ -65,7 +58,7 @@ def train_rscv(X_train, y_train, drop_feats, n_iter=30):
         n_iter=n_iter,
         scoring='f1',
         cv=5,
-        verbose=1,
+        verbose=0,
         n_jobs=-1,
         random_state=42
     )

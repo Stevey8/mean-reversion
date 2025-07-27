@@ -7,11 +7,10 @@ watchlist = [
     'spot','tsm','rddt','mstr','rklb',
 ]
 
-target_threshold = 0.02
-lookahead = 5
-retrain_day = "Sunday"
+# watchlist = ['nvda','spot','pltr']
 
-
+target_long_threshold = 0.02
+target_long_lookahead = 5
 
 drop_feats = [
     # 'date',
@@ -19,7 +18,6 @@ drop_feats = [
     'bollinger_upper','bollinger_lower',
     'rsi_smooth',
 ]
-
 
 backtest_config = {
     'proba_threshold': 0.6,

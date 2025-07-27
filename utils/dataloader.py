@@ -1,19 +1,37 @@
 import yfinance as yf
 import os
+from datetime import timedelta, datetime, date
 import pandas as pd
 import numpy as np
 import ta
 from scipy.signal import argrelextrema
+from arch import arch_model
+from config import target_long_threshold, target_long_lookahead
 
 
-def get_data(ticker, start_date='1999-01-01', end_date=None, save_csv=False):
+def get_data(
+        ticker, 
+        start_date='1999-01-01', 
+        end_date=None, 
+        save_csv=False
+):
     os.makedirs("data", exist_ok=True)
     filename = f"data/{ticker.lower()}.csv"
     # if os.path.exists(filename):
     #     print(f"Data for {i} already exists, skipping download.")
     #     continue
 
-    data = yf.download(ticker.upper(), start=start_date, end=end_date, auto_adjust=True)
+    # add one day to end_date because yf.download end is not inclusive
+    if end_date is not None:
+        end_date = pd.to_datetime(end_date).date()
+        end_date = (end_date + timedelta(days=1)).isoformat()
+
+    data = yf.download(
+        ticker.upper(), 
+        start=start_date, 
+        end=end_date, 
+        auto_adjust=True
+    )
 
     # Handle empty or failed download
     if data.empty:
@@ -39,7 +57,7 @@ def get_data(ticker, start_date='1999-01-01', end_date=None, save_csv=False):
 # model for longing; trading at open tomorrow (t+1)
 # based on today's data (ohlcv and more), decide whether to long tomorrow
 # binary target: 1 if price reverts up (above the threshold e.g. gain over 2%) wihtin the next five trading days, 0 otherwise
-def create_target_long(df, threshold=0.02, lookahead=5):
+def create_target_long(df, threshold=target_long_threshold, lookahead=target_long_lookahead):
     """
     Label as 1 if max return over the next 'lookahead' days is >= threshold.
     Else, label as 0.
@@ -59,8 +77,9 @@ def create_target_long(df, threshold=0.02, lookahead=5):
     df['future_max'] = future_max_list
 
     df['future_return'] = (df['future_max'] - df['price_tmrw']) / df['price_tmrw']
-    df['target_long'] = (df['future_return'] >= threshold).astype(int)
+    df['target_long'] = (df['future_return'] >= threshold).where(df['future_return'].notna())
     df.drop(columns=['seq_index', 'price_tmrw', 'future_max', 'future_return'], inplace=True)
+    df.dropna(inplace=True)
     return df
 
 
