@@ -24,10 +24,16 @@ from tabulate import tabulate
 
 # -----
 
-def load_dfs(filepath='dfs_storage.pkl'):
+def load_dfs(filepath='dfs_storage.pkl', metadata=False):
     if os.path.exists(filepath):
         with open(filepath, 'rb') as f:
             dfs = pickle.load(f)
+        if metadata:
+            print("NOTE: metadata included in this dfs")
+            print("get metadata by calling one of its keys from dfs['metadata']:")
+            print(dfs['metadata'].keys())
+        else:
+            dfs.pop('metadata', None)
         return dfs
     else:
         return {}
@@ -125,6 +131,7 @@ def build_dict(ticker, end_date = None):
 
 def update_dfs(
         watchlist=watchlist, 
+        dfs = None,
         tickers_to_retrain=None, 
         end_date = None,
         load_existing=True,
@@ -132,11 +139,17 @@ def update_dfs(
 ):
     if load_existing:
         dfs = load_dfs()
-    else:
+    elif dfs is None: 
         dfs = {}
 
     tickers_to_retrain = tickers_to_retrain or []
     tickers_trained_this_time = []
+
+    if any(
+        x is not None and not isinstance(x, (list, tuple))
+        for x in [watchlist, tickers_to_retrain]
+    ):
+        raise TypeError("watchlist and tickers_to_retrain must be list or tuple (or None).")
 
     for idx, ticker in enumerate(watchlist):
         print(f"{ticker} out of {idx}/{len(watchlist)} tickers...")
@@ -179,13 +192,11 @@ def update_dfs(
 
 # -----
 
-def run_pred(ticker, model = None, start_date = None, end_date = None): 
+def run_pred(ticker, model = None, model_date = None, start_date = None, end_date = None): 
     if model is None: 
         dfs = load_dfs() 
         model = dfs[ticker]['final_model']
-        model_date = dfs[ticker]['final_model_fit_with_data_up_to']
-    else: 
-        model_date = None
+        model_date = dfs[ticker]['final_model_data_up_to']
 
     if start_date is None:
         year_ahead = date.today() - timedelta(days=365)
@@ -204,10 +215,14 @@ def run_pred(ticker, model = None, start_date = None, end_date = None):
     data = feature_engineering_add_macro(data, 'spy')
     data = feature_engineering_add_macro(data, 'qqq')
 
-    start = start_date or most_recent_date
-    end = end_date or most_recent_date
-
-    data_to_pred = data[start:end]
+    if start_date is None and end_date is None:
+        data_to_pred = data[most_recent_date:most_recent_date]
+    elif end_date is None: # has start date but no end date 
+        data_to_pred = data[start_date:most_recent_date]
+    elif start_date is None: # has end date but no start date 
+        data_to_pred = data[end_date:end_date]
+    else:
+        data_to_pred = data[start_date:end_date]
 
     if model_date is not None and data_to_pred.index.min() <= pd.Timestamp(model_date):
         print(f"WARNING: this model (uses data up to {model_date.isoformat()})"
@@ -225,28 +240,67 @@ def run_pred(ticker, model = None, start_date = None, end_date = None):
 
     my_d = {
         'ticker': [ticker] * len(y_hardpred),
-        'pred': y_hardpred, # should enter the next day?
+        'date': pd.to_datetime(data_to_pred.index),
+        'next_day_over_50%?': y_hardpred, # should enter the next day?
         'proba': y_softpred,
         'sma30': data_to_pred['sma30'], # sma30 as of the date
         'atr': data_to_pred['atr'], # atr as of the date
         'garch_vol': data_to_pred['garch_vol'] # garch volatility as of the date 
     }
 
-    return pd.DataFrame(my_d, index=data_to_pred.index)
+    return pd.DataFrame(my_d) # no (meaning default) index
+
+
+def run_pred_dfs(
+    tickers=watchlist,
+    dfs=None,
+    start_date=None, 
+    end_date=None,
+    load_existing=True
+):
+    if load_existing:
+        dfs = load_dfs()
+    elif dfs is None:
+        raise ValueError("No data provided (dfs is None).")
+
+    if not isinstance(tickers, (list, tuple)):
+        raise TypeError("tickers must be a list or tuple.")
+
+    df_all = []
+    for t in tickers:
+        if t not in dfs:
+            print(f"{t} not found in dfs — skipping.")
+            continue
+        model = dfs[t]['final_model']
+        model_date = dfs[t]['final_model_data_up_to']
+        df_pred = run_pred(t, model, model_date, start_date, end_date)
+        df_all.append(df_pred)
+
+    if df_all:
+        return pd.concat(df_all).set_index('ticker')
+    else:
+        return pd.DataFrame()
 
 
 # -----
 
-def check_backtest_metrics(dfs=None, load_existing=True, sort_by = None):
+def check(
+        dfs=None, 
+        load_existing=True, 
+        with_pred=True,
+        print_df=True,
+        save_csv=True
+):
+    print("checking...")
     if load_existing:
         dfs = load_dfs()
-    else:
-        dfs = dfs
-    
+    elif dfs is None:
+        print("no data available (dfs is None)")
+        return None
+
+    # ---- Collect backtest stats ----
     my_d = {}
-    for k,v in dfs.items():
-        if k=='metadata':
-            continue
+    for k, v in dfs.items():
         my_d[k] = {
             'total_trading_days': v['test_set_result']['total_trading_days'],
             'holding_time_percentage': v['test_set_result']['holding_time_percentage'],
@@ -256,30 +310,156 @@ def check_backtest_metrics(dfs=None, load_existing=True, sort_by = None):
             'sharpe': v['test_set_result']['sharpe'],
         }
 
-
     if len(my_d) == 0:
-        print('empyt dfs')
-        return None
-
-    allowed_keys = list(next(iter(my_d.values())).keys())
-    allowed_keys = allowed_keys + ['ticker', None]
-
-    if sort_by not in allowed_keys:
-        print(f"ERROR: sort_by must be None or one of: {allowed_keys}")
+        print('empty dfs, no backtest result and prediction can be shown')
         return None
     
-    df = pd.DataFrame.from_dict(my_d, orient='index')
-    if sort_by == 'ticker':
-        df = df.sort_index(ascending=True)
-    elif sort_by is not None:
-        df = df.sort_values(by=sort_by, ascending=False)
-    
-    df_display = df.copy()
+    df_stats = pd.DataFrame.from_dict(my_d, orient='index')
+    df_stats.index.name = 'ticker'
 
-    df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
-    df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
-    df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
-    df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
+    # ---- get prediction ----
+    df_pred = None
+    if with_pred: 
+        df_pred = run_pred_dfs(dfs=dfs, load_existing=False) 
+        max_date = df_pred['date'].max().date().isoformat()
+        df_pred['backtest→'] = None
+        df = df_pred.merge(df_stats, on='ticker', how='left')
+    else: 
+        df = df_stats
+        max_date = None
 
-    print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
+    # ---- Save prediction DataFrame ----
+    if with_pred and save_csv and df_pred is not None and not df_pred.empty:
+        os.makedirs("predictions", exist_ok=True)
+        df.to_csv(f"predictions/predictions_{max_date}.csv", index=False)
+        print(f"✅ Predictions saved to predictions/predictions_{max_date}.csv")
+
+    # ---- Display Section ----
+    if print_df:
+        if max_date:
+            print(f"predicted on data on/up to {max_date}:")
+            if len(df['date'].unique()) == 1:
+                df.drop(columns=['date'], inplace=True)
+        else:
+            print(f"only backtest metrics:")
+        
+        # Format metrics for printing
+        if 'holding_time_percentage' in df.columns:
+            df['holding_time_percentage'] = df['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
+        if 'win_rate' in df.columns:
+            df['win_rate'] = df['win_rate'].apply(lambda x: f"{x:.2%}")
+        if 'cagr' in df.columns:
+            df['cagr'] = df['cagr'].apply(lambda x: f"{x:.2%}")
+        if 'sharpe' in df.columns:
+            df['sharpe'] = df['sharpe'].apply(lambda x: f"{x:.3f}")
+
+        df.sort_values(by=['proba','win_rate'],ascending=False, inplace=True)
+        print(tabulate(df, headers='keys', tablefmt='fancy_grid'))
+
     return None
+
+
+
+        
+
+
+    
+    
+
+    
+
+
+
+
+
+
+    # allowed_keys = list(next(iter(my_d.values())).keys()) + ['ticker', None]
+
+    # if sort_by not in allowed_keys:
+    #     print(f"ERROR: sort_by must be None or one of: {allowed_keys}")
+    #     return None
+
+    # df_stats = pd.DataFrame.from_dict(my_d, orient='index')
+
+    # if pred_df is not None and not pred_df.empty:
+        
+
+
+    # if sort_by == 'ticker':
+    #     df_stats = df_stats.sort_index(ascending=True)
+    # elif sort_by is not None:
+    #     df_stats = df_stats.sort_values(by=sort_by, ascending=False)
+
+    # # ---- Save prediction DataFrame ----
+    # if with_pred and save_csv and pred_df is not None and not pred_df.empty:
+    #     max_date = pred_df.index.get_level_values("date").max()
+    #     date_str = pd.to_datetime(max_date).date().isoformat()
+    #     os.makedirs("predictions", exist_ok=True)
+
+    #     # Copy and safely reset index without mutating original pred_df
+    #     pred_df_safe = pred_df.copy()
+    #     pred_df_safe.index.names = ['_ticker', '_date']
+    #     pred_df_out = pred_df_safe.reset_index()
+    #     pred_df_out = pred_df_out.rename(columns={'_ticker': 'ticker', '_date': 'date'})
+
+    #     pred_df_out.to_csv(f"predictions/predictions_{date_str}.csv", index=False)
+    #     print(f"✅ Predictions saved to predictions/predictions_{date_str}.csv")
+
+    # # ---- Display Section ----
+    # if print_df:
+    #     if with_pred and pred_df is not None and not pred_df.empty:
+    #         # Ensure correct index names
+    #         if pred_df.index.names != ["ticker", "date"]:
+    #             pred_df.index.set_names(["ticker", "date"], inplace=True)
+
+    #         unique_dates = pred_df.index.get_level_values("date").unique()
+    #         multiple_dates = len(unique_dates) > 1
+    #         max_date = unique_dates.max()
+    #         date_str = pd.to_datetime(max_date).date().isoformat()
+
+    #         if multiple_dates:
+    #             df_display = pred_df.copy()  # MultiIndex: [ticker, date]
+    #         else:
+    #             df_display = pred_df.xs(key=max_date, level="date")  # index: ticker only
+
+    #         df_display = df_display.merge(df_stats, left_index=True, right_index=True, how="left")
+
+    #         # Reorder columns
+    #         pred_cols = ['signal', 'proba_long', 'sma30', 'atr', 'garch_vol']
+    #         available_pred_cols = [col for col in pred_cols if col in df_display.columns]
+    #         backtest_cols = [col for col in df_stats.columns if col in df_display.columns]
+
+    #         # Insert separator
+    #         df_display.insert(len(available_pred_cols), '← backtest metrics on the right', '')
+
+    #         # Final column order
+    #         df_display = df_display[available_pred_cols + ['backtest metrics →'] + backtest_cols]
+
+    #         # Format metrics for printing
+    #         if 'holding_time_percentage' in df_display.columns:
+    #             df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
+    #         if 'win_rate' in df_display.columns:
+    #             df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
+    #         if 'cagr' in df_display.columns:
+    #             df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
+    #         if 'sharpe' in df_display.columns:
+    #             df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
+
+    #         if multiple_dates:
+    #             print(f"data as of multiple dates (prediction means whether to long the next trading day)")
+    #         else:
+    #             print(f"data as of {date_str} (prediction means whether to long the next trading day)")
+
+    #         print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
+
+    #     else:
+    #         df_display = df_stats.copy()
+    #         df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
+    #         df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
+    #         df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
+    #         df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
+
+    #         print("data as of N/A (no prediction run)")
+    #         print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
+
+    # return None

@@ -30,7 +30,8 @@ def get_data(
         ticker.upper(), 
         start=start_date, 
         end=end_date, 
-        auto_adjust=True
+        auto_adjust=True,
+        progress=False
     )
 
     # Handle empty or failed download
