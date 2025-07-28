@@ -61,12 +61,13 @@ def weekly_retraining():
 
 
 def setup_schedule():
-    schedule.every().monday.at("20:00").do(check)
-    schedule.every().tuesday.at("20:00").do(check)
-    schedule.every().wednesday.at("20:00").do(check)
-    schedule.every().thursday.at("20:00").do(check)
-    schedule.every().friday.at("20:00").do(check)
-    schedule.every().friday.at("18:00").do(weekly_retraining)
+    schedule.every().sunday.at("00:00").do(weekly_retraining)
+    schedule.every().monday.at("09:00").do(check)
+    schedule.every().tuesday.at("09:00").do(check)
+    schedule.every().wednesday.at("09:00").do(check)
+    schedule.every().thursday.at("09:00").do(check)
+    schedule.every().friday.at("09:00").do(check)
+    
 
 
 

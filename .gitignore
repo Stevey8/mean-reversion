@@ -11,6 +11,7 @@ api_keys.py
 data/
 logs/
 results/
+.vscode/
 
 models/
 *.h5
