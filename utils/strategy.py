@@ -133,13 +133,13 @@ def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1):
                 ret = (next_price - entry_price) / entry_price
 
                 # Exit Conditions
-                if ret >= take_profit * 0.01 * multiplier.iloc[i]:  # profit target
+                if ret >= take_profit * multiplier.iloc[i]:  # profit target
                     exit_price = next_price
                     exit_date = df['date'].iloc[i + 1 + j]
                     holding = j
                     exit_reason = 'profit_target'
                     break
-                elif ret <= -stop_loss * 0.01 * multiplier.iloc[i]:  # stop loss
+                elif ret <= -stop_loss * multiplier.iloc[i]:  # stop loss
                     exit_price = next_price
                     exit_date = df['date'].iloc[i + 1 + j]
                     holding = j

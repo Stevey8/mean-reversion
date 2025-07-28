@@ -152,7 +152,7 @@ def update_dfs(
         raise TypeError("watchlist and tickers_to_retrain must be list or tuple (or None).")
 
     for idx, ticker in enumerate(watchlist):
-        print(f"{ticker} out of {idx}/{len(watchlist)} tickers...")
+        print(f"{ticker} out of {idx+1}/{len(watchlist)} tickers...")
         if ticker in tickers_to_retrain:  # should train
             print(f"{ticker} explicitly retraining...")
             result = build_dict(ticker, end_date)
@@ -241,11 +241,14 @@ def run_pred(ticker, model = None, model_date = None, start_date = None, end_dat
     my_d = {
         'ticker': [ticker] * len(y_hardpred),
         'date': pd.to_datetime(data_to_pred.index),
-        'next_day_over_50%?': y_hardpred, # should enter the next day?
+        'tmrw_over_50%?': y_hardpred, # should enter at open the next day?
         'proba': y_softpred,
-        'sma30': data_to_pred['sma30'], # sma30 as of the date
+        'most_recent→': [None] * len(y_hardpred),
         'atr': data_to_pred['atr'], # atr as of the date
-        'garch_vol': data_to_pred['garch_vol'] # garch volatility as of the date 
+        'garch_vol%': data_to_pred['garch_vol'], # garch volatility in % as of the date 
+        'sma30': data_to_pred['sma30'], # sma30 as of the date
+        'today_open': data_to_pred['open'],
+        'today_close': data_to_pred['close']
     }
 
     return pd.DataFrame(my_d) # no (meaning default) index
@@ -303,9 +306,9 @@ def check(
     for k, v in dfs.items():
         my_d[k] = {
             'total_trading_days': v['test_set_result']['total_trading_days'],
-            'holding_time_percentage': v['test_set_result']['holding_time_percentage'],
+            'holding_time%': v['test_set_result']['holding_time_percentage'],
             'n_trades': v['test_set_result']['n_trades'],
-            'win_rate': v['test_set_result']['win_rate'],
+            'win%': v['test_set_result']['win_rate'],
             'cagr': v['test_set_result']['cagr'],
             'sharpe': v['test_set_result']['sharpe'],
         }
@@ -344,122 +347,24 @@ def check(
             print(f"only backtest metrics:")
         
         # Format metrics for printing
-        if 'holding_time_percentage' in df.columns:
-            df['holding_time_percentage'] = df['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
-        if 'win_rate' in df.columns:
-            df['win_rate'] = df['win_rate'].apply(lambda x: f"{x:.2%}")
+        if 'proba' in df.columns:
+            df['proba'] = df['proba'].apply(lambda x: f"{x:.2%}")
+        if 'atr' in df.columns:
+            df['atr'] = df['atr'].apply(lambda x: f"{x:.2f}")
+        if 'garch_vol%' in df.columns:
+            df['garch_vol%'] = df['garch_vol%'].apply(lambda x: f"{x:.2f}")
+        if 'sma30' in df.columns:
+            df['sma30'] = df['sma30'].apply(lambda x: f"{x:.2f}")
+        if 'holding_time%' in df.columns:
+            df['holding_time%'] = df['holding_time%'].apply(lambda x: f"{x:.2%}")
+        if 'win%' in df.columns:
+            df['win%'] = df['win%'].apply(lambda x: f"{x:.2%}")
         if 'cagr' in df.columns:
             df['cagr'] = df['cagr'].apply(lambda x: f"{x:.2%}")
         if 'sharpe' in df.columns:
             df['sharpe'] = df['sharpe'].apply(lambda x: f"{x:.3f}")
 
-        df.sort_values(by=['proba','win_rate'],ascending=False, inplace=True)
+        df.sort_values(by=['tmrw_over_50%?','proba'],ascending=False, inplace=True)
         print(tabulate(df, headers='keys', tablefmt='fancy_grid'))
 
     return None
-
-
-
-        
-
-
-    
-    
-
-    
-
-
-
-
-
-
-    # allowed_keys = list(next(iter(my_d.values())).keys()) + ['ticker', None]
-
-    # if sort_by not in allowed_keys:
-    #     print(f"ERROR: sort_by must be None or one of: {allowed_keys}")
-    #     return None
-
-    # df_stats = pd.DataFrame.from_dict(my_d, orient='index')
-
-    # if pred_df is not None and not pred_df.empty:
-        
-
-
-    # if sort_by == 'ticker':
-    #     df_stats = df_stats.sort_index(ascending=True)
-    # elif sort_by is not None:
-    #     df_stats = df_stats.sort_values(by=sort_by, ascending=False)
-
-    # # ---- Save prediction DataFrame ----
-    # if with_pred and save_csv and pred_df is not None and not pred_df.empty:
-    #     max_date = pred_df.index.get_level_values("date").max()
-    #     date_str = pd.to_datetime(max_date).date().isoformat()
-    #     os.makedirs("predictions", exist_ok=True)
-
-    #     # Copy and safely reset index without mutating original pred_df
-    #     pred_df_safe = pred_df.copy()
-    #     pred_df_safe.index.names = ['_ticker', '_date']
-    #     pred_df_out = pred_df_safe.reset_index()
-    #     pred_df_out = pred_df_out.rename(columns={'_ticker': 'ticker', '_date': 'date'})
-
-    #     pred_df_out.to_csv(f"predictions/predictions_{date_str}.csv", index=False)
-    #     print(f"✅ Predictions saved to predictions/predictions_{date_str}.csv")
-
-    # # ---- Display Section ----
-    # if print_df:
-    #     if with_pred and pred_df is not None and not pred_df.empty:
-    #         # Ensure correct index names
-    #         if pred_df.index.names != ["ticker", "date"]:
-    #             pred_df.index.set_names(["ticker", "date"], inplace=True)
-
-    #         unique_dates = pred_df.index.get_level_values("date").unique()
-    #         multiple_dates = len(unique_dates) > 1
-    #         max_date = unique_dates.max()
-    #         date_str = pd.to_datetime(max_date).date().isoformat()
-
-    #         if multiple_dates:
-    #             df_display = pred_df.copy()  # MultiIndex: [ticker, date]
-    #         else:
-    #             df_display = pred_df.xs(key=max_date, level="date")  # index: ticker only
-
-    #         df_display = df_display.merge(df_stats, left_index=True, right_index=True, how="left")
-
-    #         # Reorder columns
-    #         pred_cols = ['signal', 'proba_long', 'sma30', 'atr', 'garch_vol']
-    #         available_pred_cols = [col for col in pred_cols if col in df_display.columns]
-    #         backtest_cols = [col for col in df_stats.columns if col in df_display.columns]
-
-    #         # Insert separator
-    #         df_display.insert(len(available_pred_cols), '← backtest metrics on the right', '')
-
-    #         # Final column order
-    #         df_display = df_display[available_pred_cols + ['backtest metrics →'] + backtest_cols]
-
-    #         # Format metrics for printing
-    #         if 'holding_time_percentage' in df_display.columns:
-    #             df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
-    #         if 'win_rate' in df_display.columns:
-    #             df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
-    #         if 'cagr' in df_display.columns:
-    #             df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
-    #         if 'sharpe' in df_display.columns:
-    #             df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
-
-    #         if multiple_dates:
-    #             print(f"data as of multiple dates (prediction means whether to long the next trading day)")
-    #         else:
-    #             print(f"data as of {date_str} (prediction means whether to long the next trading day)")
-
-    #         print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
-
-    #     else:
-    #         df_display = df_stats.copy()
-    #         df_display['holding_time_percentage'] = df_display['holding_time_percentage'].apply(lambda x: f"{x:.2%}")
-    #         df_display['win_rate'] = df_display['win_rate'].apply(lambda x: f"{x:.2%}")
-    #         df_display['cagr'] = df_display['cagr'].apply(lambda x: f"{x:.2%}")
-    #         df_display['sharpe'] = df_display['sharpe'].apply(lambda x: f"{x:.3f}")
-
-    #         print("data as of N/A (no prediction run)")
-    #         print(tabulate(df_display, headers='keys', tablefmt='fancy_grid'))
-
-    # return None

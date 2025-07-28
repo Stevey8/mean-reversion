@@ -17,6 +17,7 @@ drop_feats = [
     'high','low','sma30','sma10','std30',
     'bollinger_upper','bollinger_lower',
     'rsi_smooth',
+    'adx_pos', 'adx_neg'
 ]
 
 backtest_config = {

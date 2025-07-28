@@ -4,6 +4,7 @@ from datetime import timedelta, datetime, date
 import pandas as pd
 import numpy as np
 import ta
+from ta.trend import MACD, ADXIndicator
 from scipy.signal import argrelextrema
 from arch import arch_model
 from config import target_long_threshold, target_long_lookahead
@@ -86,13 +87,13 @@ def create_target_long(df, threshold=target_long_threshold, lookahead=target_lon
 
 def feature_engineering(df): # for trading at open tomorrow
     # bollinger bands and rsi
-    df['sma30'] = df['close'].rolling(30).mean()
-    df['sma10'] = df['close'].rolling(10).mean()
+    df['sma30'] = df['close'].rolling(30).mean() # wont be used 
+    df['sma10'] = df['close'].rolling(10).mean() # wont be used
     df['sma_diff'] = df['sma10'] - df['sma30']
     df['sma_slope'] = df['sma10'].diff()
-    df['std30'] = df['close'].rolling(30).std()
-    df['bollinger_upper'] = df['sma30'] + 2 * df['std30']
-    df['bollinger_lower'] = df['sma30'] - 2 * df['std30']
+    df['std30'] = df['close'].rolling(30).std() # wont be used 
+    df['bollinger_upper'] = df['sma30'] + 2 * df['std30'] # wont be used 
+    df['bollinger_lower'] = df['sma30'] - 2 * df['std30'] # wont be used 
     df['percent_b'] = (df['close'] - df['bollinger_lower']) / (df['bollinger_upper'] - df['bollinger_lower'])
     df['bollinger_z'] = (df['close'] - df['sma30']) / df['std30']
     df['price_near_lower_bb'] = (df['close'] <= df['bollinger_lower'] * 1.01).astype(int)
@@ -100,7 +101,7 @@ def feature_engineering(df): # for trading at open tomorrow
     df['prod_bollingerz_rsi'] = df['percent_b'] * df['rsi14']
 
     # Detect local lows
-    df['rsi_smooth'] = df['rsi14'].rolling(3).mean()
+    df['rsi_smooth'] = df['rsi14'].rolling(3).mean() # wont be used 
     rsi_vals = df['rsi_smooth'].values
     local_lows = argrelextrema(rsi_vals, np.less, order=5)[0]
     df['rsi_local_low'] = 0
@@ -122,6 +123,24 @@ def feature_engineering(df): # for trading at open tomorrow
     df['month'] = df.index.month
     df['week'] = df.index.isocalendar().week
     df['dayofweek'] = df.index.dayofweek
+
+    # trend following contextual features
+    # sma_slope (already added)
+    macd = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
+    # df['macd'] = macd.macd()                   # EMA12 - EMA26
+    # df['macd_signal'] = macd.macd_signal()     # 9-day EMA of MACD
+    df['macd_diff'] = macd.macd_diff()         # Histogram: MACD - Signal
+
+    adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+
+    df['adx'] = adx.adx()              # Trend strength
+    df['adx_pos'] = adx.adx_pos()      # +DI; wont be used
+    df['adx_neg'] = adx.adx_neg()      # -DI; wont be used
+
+    # df['macd_uptrend'] = (df['macd_diff'] > 0).astype(int)
+    df['strong_trend'] = (df['adx'] > 25).astype(int)
+    df['up_trend_context'] = ((df['adx'] > 25) & (df['adx_pos'] > df['adx_neg'])).astype(int)
+    df['down_trend_context'] = ((df['adx'] > 25) & (df['adx_neg'] > df['adx_pos'])).astype(int)
 
     # df.dropna(inplace=True)
     return df
