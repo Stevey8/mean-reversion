@@ -149,7 +149,8 @@ def feature_engineering(df): # for trading at open tomorrow
 # useful for adding information from macro market trend
 # e.g. spy, qqq
 def feature_engineering_add_macro(df,etf:str):
-    df_etf = get_data(etf, end_date = df.index.max())
+    df_etf = get_data(etf)[:df.index.max()]
+
     df_etf['sma10'] = df_etf['close'].rolling(10).mean()
     df_etf['sma20'] = df_etf['close'].rolling(20).mean()
     df_etf['sma50'] = df_etf['close'].rolling(50).mean()

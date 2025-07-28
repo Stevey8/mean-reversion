@@ -21,7 +21,7 @@ from xgboost import XGBClassifier, plot_importance
 
 # TRAIN 
 
-def get_pipeline(drop_feats):
+def get_pipeline(drop_feats, scale_pos_weight):
     ct = make_column_transformer(
         ('drop', drop_feats),  
         remainder='passthrough'  
@@ -32,6 +32,7 @@ def get_pipeline(drop_feats):
             objective='binary:logistic',
             eval_metric='logloss',
             use_label_encoder=False,
+            scale_pos_weight=scale_pos_weight,
             random_state=42,
             verbosity=0
         ))
@@ -51,7 +52,8 @@ def get_param_grid():
 
 
 def train_rscv(X_train, y_train, drop_feats, n_iter=30):
-    pipe = get_pipeline(drop_feats)
+    scale_pos_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1]) # neg class / pos class
+    pipe = get_pipeline(drop_feats, scale_pos_weight)
     rscv = RandomizedSearchCV(
         pipe,
         param_distributions=get_param_grid(),
@@ -68,7 +70,8 @@ def train_rscv(X_train, y_train, drop_feats, n_iter=30):
 
 
 def train_with_best_param(X, y, drop_feats, fitted_rscv):
-    pipe = get_pipeline(drop_feats)
+    scale_pos_weight = len(y[y == 0]) / len(y[y == 1])
+    pipe = get_pipeline(drop_feats, scale_pos_weight)
     best_params = {k: v for k, v in fitted_rscv.best_params_.items() if k.startswith('xgb__')}
     best_model = pipe.set_params(**best_params)
     best_model.fit(X, y)
