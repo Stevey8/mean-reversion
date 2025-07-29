@@ -46,7 +46,11 @@ def save_dfs(dfs, filepath='dfs_storage.pkl'):
 
 # -----
 
-def build_dict(ticker, end_date = None):
+def build_dict(ticker, end_date = None, use_model = None):
+    # use_model is either None or a dictionary
+    # that use the trained model from the existing dfs
+    # so that no need to spend time training the same model again
+    # it contains keys including 'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'
     try: 
         df = get_data(ticker, end_date=end_date)
         if not df.empty:
@@ -100,46 +104,53 @@ def build_dict(ticker, end_date = None):
     ])
 
     # train
-    print('training rscv (with scaled class weights)...')
-    fitted_train = train_rscv(X_train, y_train, drop_feats, n_iter=30)
-    my_d['train_set_model'] = {
-        'model': fitted_train,
-        'best_estimator': fitted_train.best_estimator_,
-        'best_params': fitted_train.best_params_,
-        'best_score': fitted_train.best_score_,
-    }
-    print('rscv trained, best params found. now backtesting...')
-    # pred and backtest
+    if use_model is None: 
+        print('training rscv (with scaled class weights)...')
+        fitted_train = train_rscv(X_train, y_train, drop_feats, n_iter=30)
+        my_d['train_set_model'] = {
+            'model': fitted_train,
+            'best_estimator': fitted_train.best_estimator_,
+            'best_params': fitted_train.best_params_,
+            'best_score': fitted_train.best_score_,
+        }
+        print('rscv trained, best params found. now backtesting...')
+        # pred and backtest
 
-    df_trade, trade_stats = backtest(X_test, fitted_train, **backtest_config)
-    total_trading_days = trade_stats['total_trading_days']
+        df_trade, trade_stats = backtest(X_test, fitted_train, **backtest_config)
+        total_trading_days = trade_stats['total_trading_days']
 
-    my_d['test_set_result'] = {
-        'backtest_config': backtest_config,
-        **trade_stats,
-        'cagr': get_cagr(df_trade),
-        'sharpe': get_sharpe(df_trade, total_trading_days)
-    }
-    # trade states:
-        # 'exit_reason_spread'
-        # 'holding_days_spread'
-        # 'total_trading_days'
-        # 'total_holding_days'
-        # 'holding_time_percentage'
-        # 'n_trades'
-        # 'n_wins'
-        # 'win_rate'
+        my_d['test_set_result'] = {
+            'backtest_config': backtest_config,
+            **trade_stats,
+            'cagr': get_cagr(df_trade),
+            'sharpe': get_sharpe(df_trade, total_trading_days)
+        }
+        # trade states:
+            # 'exit_reason_spread'
+            # 'holding_days_spread'
+            # 'total_trading_days'
+            # 'total_holding_days'
+            # 'holding_time_percentage'
+            # 'n_trades'
+            # 'n_wins'
+            # 'win_rate'
 
-    print('backtesting done. now train the final model...')
-    # train the final model on all data
-    final_model = train_with_best_param(X, y, drop_feats, fitted_train)
-    my_d['final_model'] = final_model
-    my_d['final_model_data_up_to'] = df_date_max.isoformat()
-    my_d['last_update'] = datetime.today()
+        print('backtesting done. now train the final model...')
+        # train the final model on all data
+        final_model = train_with_best_param(X, y, drop_feats, fitted_train)
+        my_d['final_model'] = final_model
+        my_d['final_model_data_up_to'] = df_date_max.isoformat()
+        my_d['last_update'] = datetime.today()
 
-    print("\n" + "="*30)
-    print(f"🐣{ticker} model ready LFG🗣️🗣️🗣️")
-    print("="*30 + "\n")
+        print("\n" + "="*30)
+        print(f"🐣{ticker} model ready LFG🗣️🗣️🗣️")
+        print("="*30 + "\n")
+
+    else:
+        if set(use_model.keys()) == {'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'}:
+            my_d.update(use_model)
+        else: 
+            raise KeyError("keys in use_model (a dict) not matched")
 
     return my_d
 
@@ -152,11 +163,16 @@ def update_dfs(
         end_date = None,
         load_existing=True,
         force_retrain=False,
+        update_without_retrain=False,
 ):
     if load_existing:
         dfs = load_dfs()
     elif dfs is None: 
         dfs = {}
+
+    if end_date is None:
+        end_date = datetime.today().date() - timedelta(days=((datetime.today().date().weekday() - 6) % 7 or 7))
+    print(f"model will be trained based on data on and before {end_date}")
 
     tickers_to_retrain = tickers_to_retrain or []
     tickers_trained_this_time = []
@@ -169,9 +185,11 @@ def update_dfs(
 
     skipped = []
     failed = []
+
     for idx, ticker in enumerate(watchlist):
         print(f"{ticker} out of {idx+1}/{len(watchlist)} tickers...")
-        if ticker in tickers_to_retrain:  # should train
+
+        if ticker in tickers_to_retrain:  # should always train
             print(f"{ticker} explicitly retraining...")
             result = build_dict(ticker, end_date)
             if result:
@@ -181,9 +199,16 @@ def update_dfs(
                 print(f"{ticker} not proceesed due to data issue.")
                 failed.append(ticker)
         elif ticker in dfs and not force_retrain:
-            print(f"{ticker} skipped (last updated at {dfs[ticker]['last_update']}).")
-            skipped.append(ticker)
-            continue
+            if update_without_retrain:
+                subset_keys = {'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'}
+                use_model = {k: dfs[ticker][k] for k in subset_keys}
+                result = build_dict(ticker, end_date, use_model=use_model)
+                if result:
+                    dfs[ticker] = result
+            else:
+                print(f"{ticker} skipped (last updated at {dfs[ticker]['last_update']}).")
+                skipped.append(ticker)
+                continue
         else:  # should train
             print(f"{ticker} training (new or forced)...")
             result = build_dict(ticker, end_date)
@@ -270,14 +295,14 @@ def run_pred(ticker, model = None, model_date = None, start_date = None, end_dat
     my_d = {
         'ticker': [ticker] * len(y_hardpred),
         'date': pd.to_datetime(data_to_pred.index),
-        'tmrw_over_50%?': y_hardpred, # should enter at open the next day?
+        'pred': y_hardpred, # should enter at open the next day?
         'proba': y_softpred,
-        'most_recent→': [None] * len(y_hardpred),
+        '→': [None] * len(y_hardpred), # indicates that most recent data (e.g., today after market close) is shown on the right
         'atr': data_to_pred['atr'], # atr as of the date
         'garch_vol%': data_to_pred['garch_vol'], # garch volatility in % as of the date 
         'sma30': data_to_pred['sma30'], # sma30 as of the date
-        'today_open': data_to_pred['open'],
-        'today_close': data_to_pred['close']
+        'open': data_to_pred['open'],
+        'close': data_to_pred['close']
     }
 
     return pd.DataFrame(my_d) # no (meaning default) index
@@ -358,7 +383,7 @@ def check(
     if with_pred: 
         df_pred = run_pred_dfs(dfs=dfs, load_existing=False, start_date=start_date, end_date=end_date) 
         max_date = df_pred['date'].max()
-        df_pred['backtest→'] = None
+        df_pred['→→'] = None # indicates that backtest result shows on the right
         df = df_pred.merge(df_stats, on='ticker', how='left')
     else: 
         df = df_stats
@@ -373,15 +398,27 @@ def check(
     # ---- Display Section ----
     if print_df:
         if max_date:
+            print("some col names:\n"
+                  "  pred: the hard binary prediction (threshold=0.5) of whether should long tomorrow\n"
+                  "  →: most recent data (e.g., up to today after market close)\n"
+                  "  Gv%: garch(1,1) volatility (%)\n"
+                  "  open: today open price\n"
+                  "  close: today close\n"
+                  "  →→: backtest result (from test set)\n"
+                  "  ttd: total trading days (=len(X_test))\n"
+                  "  ht% : hodling time (%)\n"
+                  "  nt: number of trades")
+
+
             # for those with hard pred == 1,
             # should pose warning if any ticker has train set rows less than 252 / each of the y train classes (1/0) less than 100
-            true_tickers = set(df[df['tmrw_over_50%?']==True].index)
+            true_tickers = set(df[df['pred']==True].index)
             small_train_set = []
             for i in true_tickers:
                 if dfs[i]['small_train_set']:
                     small_train_set.append(i)
             if len(small_train_set)>0:
-                print(f"WARNING: small training set (has <252rows / <100 pos or neg class) used for backtesting: "
+                print(f"WARNING: small training set (has <252 rows / <100 pos or neg class) used for backtesting:\n"
                       f"{small_train_set}")
 
             print(f"predicted on data on/up to {max_date.isoformat()}:")
@@ -408,7 +445,15 @@ def check(
         if 'sharpe' in df.columns:
             df['sharpe'] = df['sharpe'].apply(lambda x: f"{x:.3f}")
 
-        df.sort_values(by=['tmrw_over_50%?','proba'],ascending=False, inplace=True)
-        print(tabulate(df, headers='keys', tablefmt='fancy_grid'))
+        df.sort_values(by=['pred','proba'],ascending=False, inplace=True)
+
+        for_print = df.rename(columns={
+            'garch_vol%': 'Gv%',
+            'total_trading_days': 'ttd',
+            'holding_time%': 'ht%',
+            'n_trades': 'nt'
+        })
+        for_print.index.name = 'tkr'
+        print(tabulate(for_print, headers='keys', tablefmt='fancy_grid'))
 
     return None
