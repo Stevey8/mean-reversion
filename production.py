@@ -73,6 +73,10 @@ def build_dict(ticker, end_date = None):
     X = df.drop(columns = ['target_long','ticker'])
     y = df['target_long']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    train_len = len(y_train)
+    y_train_pos = y_train.sum()
+    y_train_neg = train_len - y_train_pos
+    
     my_d['prepped_data'] = {
         'X': X,
         'y': y,
@@ -82,7 +86,18 @@ def build_dict(ticker, end_date = None):
         'X_test': X_test,
         'y_train': y_train,
         'y_test': y_test,
+        'y_train_pos': y_train_pos, # flag if less than 100
+        'y_train_neg': y_train_neg, # flag if less than 100
+        'train_len': train_len # flag if training rows less than 252 (a year)
     }
+
+    # add a small dataset warning 
+    # flag if any of the three below is False
+    my_d['small_train_set'] = any([
+        train_len < 252,
+        y_train_pos < 100,
+        y_train_neg < 100
+    ])
 
     # train
     print('training rscv (with scaled class weights)...')
@@ -353,11 +368,22 @@ def check(
     if with_pred and save_csv and df_pred is not None and not df_pred.empty:
         os.makedirs("predictions", exist_ok=True)
         df.to_csv(f"predictions/pred_{max_date.date().isoformat()}.csv", index=False)
-        print(f"✅ Predictions saved to predictions/pred_{max_date.date().isoformat()}.csv")
+        print(f"✅ Predictions saved to predictions/pred_{max_date.date().isoformat()}.csv\n")
 
     # ---- Display Section ----
     if print_df:
         if max_date:
+            # for those with hard pred == 1,
+            # should pose warning if any ticker has train set rows less than 252 / each of the y train classes (1/0) less than 100
+            true_tickers = set(df[df['tmrw_over_50%?']==True].index)
+            small_train_set = []
+            for i in true_tickers:
+                if dfs[i]['small_train_set']:
+                    small_train_set.append(i)
+            if len(small_train_set)>0:
+                print(f"WARNING: small training set (has <252rows / <100 pos or neg class) used for backtesting: "
+                      f"{small_train_set}")
+
             print(f"predicted on data on/up to {max_date.isoformat()}:")
             if len(df['date'].unique()) == 1:
                 df.drop(columns=['date'], inplace=True)
