@@ -1,63 +1,89 @@
-from production import build_dict, load_dfs, save_dfs, update_dfs, run_pred, run_pred_dfs, check
+from production import update_data_pkl, update_models_pkl, check_backtest as check_backtest_prod, run_pred
 from config import watchlist
 
-import pandas as pd
 import os
 import sys
-import time
-import schedule
-from datetime import date, datetime
+import functools
 import warnings
+from zoneinfo import ZoneInfo
+import schedule
+from datetime import time as dt_time, datetime, timedelta
+import time  # <-- the module, for sleep()
+
 warnings.filterwarnings("ignore")
 
+TZ = ZoneInfo("America/Toronto")
+MARKET_CLOSE = dt_time(16, 30)  # 4:30pm ET
+MARKET_OPEN  = dt_time(9, 30)   # 9:30am ET
+LOCKFILE = "/tmp/weekly_retraining.lock"
 
+def within_weekend_retrain_window(now: datetime) -> bool:
+    now_et = now.astimezone(TZ)
+    wd = now_et.weekday()  # Mon=0..Sun=6
+    if wd == 4:  # Fri
+        return now_et.time() >= MARKET_CLOSE
+    if wd in (5, 6):  # Sat/Sun
+        return True
+    if wd == 0:  # Mon
+        return now_et.time() < MARKET_OPEN
+    return False
 
-globals().update({
-    'watchlist': watchlist,
-    'build_dict': build_dict,
-    'load_dfs': load_dfs,
-    'save_dfs': save_dfs,
-    'update_dfs': update_dfs,
-    'run_pred': run_pred, 
-    'run_pred_dfs':run_pred_dfs,
-    'check': check,
-})
+def single_run_lock(path=LOCKFILE):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+            except FileExistsError:
+                print("[weekly_retraining] Another run is in progress. Skipping.")
+                return
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+        return wrapper
+    return decorator
 
-os.makedirs("predictions", exist_ok=True)
-
+@single_run_lock()
 def weekly_retraining():
-    """Retrain all models (between friday after market close to monday before market open)"""
+    now = datetime.now(tz=TZ)
+    if not within_weekend_retrain_window(now):
+        print(f"[weekly_retraining] Not in retrain window at {now}. Skipping.")
+        return
     print("=== Running Weekly Retraining ===")
-    end_date = end_date or date.today().isoformat()
-
-    dfs = update_dfs(watchlist, load_existing=True, force_retrain=True)
+    update_models_pkl()
     print("Retraining complete. Models updated and saved.")
 
+def check_backtest_job():
+    now = datetime.now(tz=TZ)
+    print(f"[check_backtest] {now.isoformat(timespec='seconds')}")
+    check_backtest_prod()
 
 def setup_schedule():
-    schedule.every().friday.at("21:00").do(weekly_retraining)
-    schedule.every().sunday.at("21:55").do(check)
-    schedule.every().monday.at("21:55").do(check)
-    schedule.every().tuesday.at("21:55").do(check)
-    schedule.every().wednesday.at("21:55").do(check)
-    schedule.every().thursday.at("21:55").do(check)
-    
+    schedule.every().friday.at("17:55").do(weekly_retraining)
+    for day in ("sunday", "monday", "tuesday", "wednesday", "thursday"):
+        getattr(schedule.every(), day).at("17:55").do(check_backtest_job)
 
-
+def run_forever():
+    setup_schedule()
+    print("[scheduler] started")
+    while True:
+        schedule.run_pending()
+        # sleep a bit; you can also compute next idle seconds if desired
+        time.sleep(1)
 
 def main():
     print("Starting scheduler. Press Ctrl+C to stop.\n")
-    print("available vars/functions to call (if running python -i main.py in terminal):")
-    print("watchlist, build_dict(), load_dfs(), save_dfs(), update_dfs(), run_pred(), run_pred_dfs(), check()")
-
-    setup_schedule()
+    print("available: watchlist, update_data_pkl(), update_models_pkl(), check_backtest_prod(), run_pred()")
+    # Start the loop only if not interactive
     if hasattr(sys, 'ps1') or sys.flags.interactive:
         print("Interactive shell detected. Scheduler not started automatically.")
     else:
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
+        run_forever()
 
 if __name__ == '__main__':
     main()

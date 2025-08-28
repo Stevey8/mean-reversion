@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
+from datetime import timedelta, datetime, date
 
 from sklearn.model_selection import RandomizedSearchCV, train_test_split, TimeSeriesSplit
-from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone, ClassifierMixin
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
 from sklearn.compose import ColumnTransformer, make_column_transformer
@@ -13,32 +15,57 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     make_scorer, accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, 
-    roc_curve, RocCurveDisplay, auc, roc_auc_score, precision_recall_curve, PrecisionRecallDisplay, precision_score, recall_score, 
+    roc_curve, RocCurveDisplay, auc, roc_auc_score, precision_recall_curve, PrecisionRecallDisplay, 
+    precision_score, recall_score, f1_score, average_precision_score
 )
 from sklearn.utils.class_weight import compute_class_weight
 from xgboost import XGBClassifier, plot_importance
 
 
-# TRAIN 
 
-def get_pipeline(drop_feats, scale_pos_weight):
-    ct = make_column_transformer(
-        ('drop', drop_feats),  
-        remainder='passthrough'  
-    )
-    pipe = Pipeline([
-        ('ct', ct),
-        ('xgb', XGBClassifier(
-            objective='binary:logistic',
-            eval_metric='logloss',
-            use_label_encoder=False,
+# =======================
+# ===== XGB Wrapper =====
+# =======================
+
+class XGB(BaseEstimator, ClassifierMixin):
+    def __init__(self, **kwargs):
+        self.xgb_params = kwargs
+        self.model = None
+
+    def fit(self, X, y):
+        y = np.asarray(y)
+        pos = np.sum(y == 1)
+        neg = np.sum(y == 0)
+        scale_pos_weight = neg / pos if pos != 0 else 1.0
+
+        self.model = XGBClassifier(
             scale_pos_weight=scale_pos_weight,
-            random_state=42,
-            verbosity=0
-        ))
-    ])
-    return pipe
+            use_label_encoder=False,
+            eval_metric='logloss',
+            objective='binary:logistic',
+            **self.xgb_params
+        )
+        self.model.fit(X, y)
+        return self
 
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+    def get_params(self, deep=True):
+        return self.xgb_params
+
+    def set_params(self, **params):
+        self.xgb_params.update(params)
+        return self
+    
+
+
+# =======================
+# ===== Train Model =====
+# =======================
 
 def get_param_grid():
     return {
@@ -49,17 +76,67 @@ def get_param_grid():
         'xgb__colsample_bytree': [0.5, 0.7, 1.0]
     }
 
+def get_drop_feats_indiv():
+    drop_feats = [
+        'high','low','sma30','sma10','std30',
+        'bollinger_upper','bollinger_lower',
+        'rsi_smooth',
+        'adx_pos', 'adx_neg',
+        'ticker',
+        'sector', 'market_cap', 'avg_volume', 'beta', 'is_sp500'
+    ] 
+    return drop_feats
+
+def get_drop_feats_global():
+    drop_feats = [
+        'high','low','sma30','sma10','std30',
+        'bollinger_upper','bollinger_lower',
+        'rsi_smooth',
+        'adx_pos', 'adx_neg',
+        'is_sp500',
+        'ticker', # drop ticker too
+    ]
+    return drop_feats
 
 
-def train_rscv(X_train, y_train, drop_feats, n_iter=30):
-    scale_pos_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1]) # neg class / pos class
-    pipe = get_pipeline(drop_feats, scale_pos_weight)
+def get_ohe_feats():
+    ohe_feats = [
+        'sector',
+    ]
+    return ohe_feats
+
+def get_pipeline_indiv(drop_feats):
+    ct = make_column_transformer(
+        ('drop', drop_feats),  
+        remainder='passthrough'  
+    )
+    pipe = Pipeline([
+        ('ct', ct),
+        ('xgb', XGB(random_state=42))
+    ])
+    return pipe
+
+def get_pipeline_global(drop_feats, ohe_feats):
+    ct = make_column_transformer(
+        ('drop', drop_feats),
+        (OneHotEncoder(handle_unknown='ignore', sparse_output=False), ohe_feats),
+        remainder='passthrough'  
+    )
+    pipe = Pipeline([
+        ('ct', ct),
+        ('xgb', XGB(random_state=42))
+    ])
+    return pipe
+
+
+
+def train_rscv(X_train, y_train, pipe, n_iter=30):
     rscv = RandomizedSearchCV(
         pipe,
         param_distributions=get_param_grid(),
         n_iter=n_iter,
         scoring='f1',
-        cv=5,
+        cv=3,
         verbose=0,
         n_jobs=-1,
         random_state=42
@@ -69,21 +146,43 @@ def train_rscv(X_train, y_train, drop_feats, n_iter=30):
 
 
 
-def train_with_best_param(X, y, drop_feats, fitted_rscv):
-    scale_pos_weight = len(y[y == 0]) / len(y[y == 1])
-    pipe = get_pipeline(drop_feats, scale_pos_weight)
+def train_with_best_param(X, y, pipe, fitted_rscv):
     best_params = {k: v for k, v in fitted_rscv.best_params_.items() if k.startswith('xgb__')}
     best_model = pipe.set_params(**best_params)
     best_model.fit(X, y)
     return best_model
 
 
+# ===========================
+# ===== Pred & Backtest =====
+# ===========================
 
+def get_prc_stats(y_test, y_proba):
+    precision, recall, thresholds = precision_recall_curve(y_test, y_proba)
+    avg_precision = average_precision_score(y_test, y_proba)
+    return precision, recall, thresholds, avg_precision
 
+def plot_prc_with_thresholds(precision, recall, thresholds, avg_precision, threshold_markers=[0, 0.5, 0.6, 0.7], title='Precision-Recall Curve'):
+    """
+    Plots a Precision-Recall curve and marks specific threshold points.
+    """
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision, label=f"PR Curve (AP = {avg_precision:.4f})", lw=2)
 
-# -----
+    for t_val in threshold_markers:
+        if t_val <= np.max(thresholds) and t_val >= np.min(thresholds):
+            idx = np.argmin(np.abs(thresholds - t_val))
+            plt.plot(recall[idx], precision[idx], 'o', label=f'Threshold = {t_val}', markersize=8)
 
-# PRED AND BACKTEST
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(title)
+    handles, labels = plt.gca().get_legend_handles_labels()
+    handles, labels = handles[::-1], labels[::-1]  # Reverse legend order
+    plt.legend(handles, labels, title="Legend")
+    plt.grid(True)
+    plt.show()
+
 
 def pred_proba_to_signal(y_proba, threshold=0.5):
     """
@@ -94,10 +193,10 @@ def pred_proba_to_signal(y_proba, threshold=0.5):
     return (y_proba >= threshold).astype(int)
 
 
-def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1): 
+def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1, min_return = 0.01): 
     '''
     FOR EACH INSTRUMENT (don't use the aggregated one that contains multiple tickers)
-    takes in the X_test or ohlcv dataframe containing model signals,
+    takes in the X_test dataframe containing model signals,
     returns a df that contains entry and exit dates, prices, returns, and holding days
     use_vol: either 'atr' or 'garch_vol'
     take_profit and stop loss as percentage
@@ -113,11 +212,13 @@ def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1):
         raise ValueError("use_vol must be one of: None, 'atr' or 'garch_vol'")
     
     if use_vol == 'atr':
-        multiplier = df['atr']
+        multiplier = df['atr']/ df['open']
     elif use_vol == 'garch_vol':
-        multiplier = df['garch_vol']
+        vol_cap = df['garch_vol'].quantile(0.9)
+        multiplier = (df['garch_vol'].clip(upper=vol_cap)) / 100
     else:
-        multiplier = pd.Series(1, index=df.index)
+        multiplier = pd.Series(0.01, index=df.index)
+    effective_profit_threshold = (take_profit * multiplier).clip(lower=min_return)
 
     while i < n - 6:  # we need at least 5 days ahead, plus trading at open tomorrow
         if df['model_signal'].iloc[i] == 1:
@@ -128,15 +229,19 @@ def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1):
             holding = None
             exit_reason = None
 
+            # exit logic:
+            # since yfinance only provides daily data (open, high, low, close),
+            # for simplicity and scrutiny (i.e. not realistic to always exit at high price),
+            # we will only check the open price for the next 5 days (t+1 to t+5)
             for j in range(1, 6):  # check up to 5 days ahead
                 if i + 1 + j >= n:
                     break
 
-                next_price = df['open'].iloc[i + 1 + j]
+                next_price = df['open'].iloc[i + 1 + j] 
                 ret = (next_price - entry_price) / entry_price
 
                 # Exit Conditions
-                if ret >= take_profit * multiplier.iloc[i]:  # profit target
+                if ret >= effective_profit_threshold.iloc[i]:  # profit target
                     exit_price = next_price
                     exit_date = df['date'].iloc[i + 1 + j]
                     holding = j
@@ -191,16 +296,64 @@ def entry_exit(df, use_vol=None, take_profit=1, stop_loss=1):
     ])
 
 
-def backtest(X_test, model, proba_threshold = 0.5, use_vol=None, take_profit=1, stop_loss=1):
-    trade_stats = {} 
+def get_cagr(df_trades):
+    if len(df_trades) > 0:
+        start_date = df_trades['entry_date'].min()
+        end_date = df_trades['exit_date'].max()
+        n_years = (end_date - start_date).days / 365.25
+        capital = 1
+        for r in df_trades['return']:
+            capital *= (1 + r)
+        cagr = capital ** (1 / n_years) - 1
+        return cagr
+    return 0
 
-    y_proba = model.predict_proba(X_test)[:, 1]
-    trade_stats['max_proba'] = y_proba.max()
+def get_sharpe(df_trades, total_trading_days):
+    if len(df_trades) > 0 and total_trading_days > 0:
+        ret_mean = df_trades['return'].mean()
+        ret_std = df_trades['return'].std()
+        n_trades = len(df_trades)
+        trades_per_year = (n_trades/total_trading_days) * 252
+        return (ret_mean/ret_std) * np.sqrt(trades_per_year)
+    return 0
 
+def get_expectancy(df_trades):
+    if len(df_trades) == 0:
+        return 0
+
+    wins = df_trades[df_trades['return'] > 0]
+    losses = df_trades[df_trades['return'] <= 0]
+
+    win_rate = len(wins) / len(df_trades)
+    loss_rate = 1 - win_rate
+
+    avg_win = wins['return'].mean() if not wins.empty else 0
+    avg_loss = abs(losses['return'].mean()) if not losses.empty else 0
+
+    expectancy = win_rate * avg_win - loss_rate * avg_loss
+    return expectancy
+
+def backtest(
+        X_backtest_input, 
+        model, 
+        proba_threshold = 0.5, 
+        use_vol=None, 
+        take_profit=1, 
+        stop_loss=1, 
+        min_return = 0.01,
+        X_model_input=None
+):
+    if X_model_input is None:
+        X_model_input = X_backtest_input
+
+
+    y_proba = model.predict_proba(X_model_input)[:, 1]
+    max_proba = y_proba.max()
     signals = pred_proba_to_signal(y_proba, threshold=proba_threshold)
-    X_test_signal = X_test.assign(model_signal=signals, y_proba=y_proba)
+    X_test_signal = X_backtest_input.copy()
+    X_test_signal = X_test_signal.assign(model_signal=signals, y_proba=y_proba)
 
-    df_trade = entry_exit(X_test_signal, use_vol, take_profit, stop_loss)
+    df_trade = entry_exit(X_test_signal, use_vol, take_profit, stop_loss, min_return)
     if len(df_trade) > 0:
         total_holding_days = df_trade['holding_days'].sum()
         total_trading_days = len(X_test_signal)
@@ -216,134 +369,50 @@ def backtest(X_test, model, proba_threshold = 0.5, use_vol=None, take_profit=1, 
         else: 
             win_rate = 0
 
+        last_5 = ''
+        last_5_returns = df_trade['return'].tail(5).tolist()
+        for r in last_5_returns:
+            if r > 0:
+                last_5 += '+'
+            else:
+                last_5 += '-'
+            
+
+        cagr = get_cagr(df_trade)
+        sharpe = get_sharpe(df_trade, total_holding_days)
+        expectancy = get_expectancy(df_trade)
+
         trade_stats = {
+            'max_proba': max_proba,
             'exit_reason_spread': df_trade['exit_reason'].value_counts(),
             'holding_days_spread': df_trade['holding_days'].value_counts(),
-            'total_trading_days': total_trading_days,
-            'total_holding_days': total_holding_days,
+            'total_trading_days': int(total_trading_days),
+            'total_holding_days': int(total_holding_days),
             'holding_time_percentage': holding_time_percentage,
             'n_trades': n_trades,
             'n_wins': n_wins,
-            'win_rate': win_rate
+            'win_rate': win_rate,
+            'last_5': last_5,
+            'cagr': cagr,
+            'sharpe': sharpe,
+            'expectancy': expectancy,
         }
     
     else:
         trade_stats = {
-            'exit_reason_spread': 'not available',
-            'holding_days_spread': 'not available',
+            'max_proba': max_proba,
+            'exit_reason_spread': 'N/A',
+            'holding_days_spread': 'N/A',
             'total_trading_days': 0,
             'total_holding_days': 0,
             'holding_time_percentage': 0,
             'n_trades': 0,
             'n_wins': 0,
-            'win_rate': 0
+            'win_rate': 0,
+            'last_5': '',
+            'cagr': 0,
+            'sharpe': 0,
+            'expectancy': 0,
         }
 
     return df_trade, trade_stats
-
-
-def get_cagr(df):
-    if len(df) > 0:
-        start_date = df['entry_date'].min()
-        end_date = df['exit_date'].max()
-        n_years = (end_date - start_date).days / 365.25
-        capital = 1
-        for r in df['return']:
-            capital *= (1 + r)
-        cagr = capital ** (1 / n_years) - 1
-        return cagr
-    return 0
-
-def get_sharpe(df_trades, total_trading_days):
-    if len(df_trades) > 0 and total_trading_days > 0:
-        ret_mean = df_trades['return'].mean()
-        ret_std = df_trades['return'].std()
-        n_trades = len(df_trades)
-        trades_per_year = (n_trades/total_trading_days) * 252
-        return (ret_mean/ret_std) * np.sqrt(trades_per_year)
-    return 0
-
-
-# -----
-
-
-# MODEL EVAL FOR TRAINING 
-
-def plot_model_metrics(y_true, y_proba):
-    y_pred = (y_proba >= 0.5).astype(int)
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-
-    # 1. Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-    disp.plot(ax=axes[0], colorbar=False)
-
-    # 2. ROC Curve
-    fpr, tpr, _ = roc_curve(y_true, y_proba)
-    roc_auc = auc(fpr, tpr)
-    roc_disp = RocCurveDisplay(fpr=fpr, tpr=tpr, roc_auc=roc_auc)
-    roc_disp.plot(ax=axes[1])
-
-    # 3. Precision-Recall Curve
-    precision, recall, _ = precision_recall_curve(y_true, y_proba)
-    pr_disp = PrecisionRecallDisplay(precision=precision, recall=recall)
-    pr_disp.plot(ax=axes[2])
-
-    plt.tight_layout()
-    plt.show()
-
-
-
-def eval_pipe(X, y, pipe, n_split=5, predict_proba_threshold=0.5):
-    '''
-    for evaluations on train set, make sure X and y does not contain anything from the test set (future data), 
-    and use n_split=5 for 5-fold time series cross-validation
-    '''
-    tscv = TimeSeriesSplit(n_splits=n_split)
-    for i, (train_index, test_index) in enumerate(tscv.split(X)):
-        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-
-        pipe.fit(X_train, y_train)
-        y_proba = pipe.predict_proba(X_test)[:, 1]
-        y_pred = (y_proba >= predict_proba_threshold).astype(int)
-
-        print(f'Fold {i+1}:\n{classification_report(y_test, y_pred)}')
-
-        if i == 0:
-            print('Fold 1 visualized below')
-            plot_model_metrics(y_test, y_proba)
-
-
-
-# -----
-
-# CHECK PRED RESULT
- 
-def check_return_stats(df):
-    if len(df) > 0:
-        print(f"check return stats: \n {df['return'].describe()}")
-        sns.histplot(df['return'])
-    print('no trade available')
-
-
-def safe_format(value, fmt, default="N/A"):
-    try:
-        return format(value, fmt) if value is not None else default
-    except (TypeError, ValueError):
-        return default
-
-def print_test_set_result(ticker, dfs):
-    result = dfs[ticker]['test_set_result']
-    
-    print(
-        f"ticker: {ticker} \n"
-        f"total_holding_days: {result.get('total_holding_days', 'N/A')} \n"
-        f"total_trading_days: {result.get('total_trading_days', 'N/A')} \n"
-        f"holding_time_percentage: {safe_format(result.get('holding_time_percentage'), '.2%')} \n" 
-        f"n_trades: {result.get('n_trades', 'N/A')} \n" 
-        f"win_rate: {safe_format(result.get('win_rate'), '.2%')} \n" 
-        f"cagr: {safe_format(result.get('cagr'), '.2%')} \n" 
-        f"sharpe: {safe_format(result.get('sharpe'), '.3')} \n" 
-        "---"
-    )

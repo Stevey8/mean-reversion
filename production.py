@@ -1,459 +1,751 @@
-from config import drop_feats, backtest_config, watchlist
+from typing import Iterable
+from config import (
+    watchlist, wrangling_config, backtest_config_1, backtest_config_2, backtest_config_3
+)
 from utils.dataloader import (
-    get_data, 
-    create_target_long, 
+    save_pkl, read_pkl,
+    get_data, get_sp500, get_metadata, 
+    select_global_candidates, 
     feature_engineering, 
-    feature_engineering_add_macro
+    market_trend, make_market_trend_dict, 
+    feature_engineering_market, feature_engineering_metadata,
+    create_target_long, 
+    wrangling,
 )
 from utils.strategy import (
-    train_rscv,
-    train_with_best_param,
-    backtest,
-    get_cagr,
-    get_sharpe
+    XGB, 
+    get_param_grid, get_drop_feats_indiv, get_drop_feats_global,
+    get_ohe_feats, get_pipeline_indiv, get_pipeline_global,
+    train_rscv, train_with_best_param, pred_proba_to_signal,
+    get_prc_stats, plot_prc_with_thresholds, 
+    entry_exit, backtest,
 )
 
 import os
+import pytz
 import pickle
-import logging # for future logging on cloud
+# import logging # for future logging on cloud
+import traceback
+import warnings
+warnings.filterwarnings("ignore")
+from tqdm import tqdm
 from datetime import date, datetime, timedelta
+
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score, recall_score
 from tabulate import tabulate
 
 
-# -----
+# ======================================
+# ===== some utility functions  =====
+# ======================================
 
-def load_dfs(filepath='dfs_storage.pkl', metadata=False):
-    if os.path.exists(filepath):
-        with open(filepath, 'rb') as f:
-            dfs = pickle.load(f)
-        if metadata:
-            print("NOTE: metadata included is this loaded dictionary")
-            print("get metadata by calling one of its keys from dfs['metadata']:")
-            print(dfs['metadata'].keys())
-        else:
-            dfs.pop('metadata', None)
-        return dfs
+
+def get_available_date(now: datetime = None) -> datetime.date:
+    """
+    Return today's date if it's a weekday after 4:30 PM,
+    otherwise return the most recent weekday before today.
+    
+    - If Saturday or Sunday: return Friday.
+    - If Monday before 4:30 PM: return Friday.
+    """
+    if now is None:
+        now = datetime.now()
+
+    # weekday(): Monday=0, Sunday=6
+    weekday = now.weekday()
+
+    # If weekend -> roll back to Friday
+    if weekday == 5:  # Saturday
+        return (now - timedelta(days=1)).date()
+    elif weekday == 6:  # Sunday
+        return (now - timedelta(days=2)).date()
+
+    # Weekday (Mon–Fri)
+    cutoff = now.replace(hour=16, minute=30, second=0, microsecond=0)
+
+    if now >= cutoff:
+        # After 4:30 PM, return today
+        return now.date()
     else:
-        return {}
-    
-
-def save_dfs(dfs, filepath='dfs_storage.pkl'):
-    with open(filepath, 'wb') as f:
-        pickle.dump(dfs, f)
-
-
-# -----
-
-def build_dict(ticker, end_date = None, use_model = None):
-    # use_model is either None or a dictionary
-    # that use the trained model from the existing dfs
-    # so that no need to spend time training the same model again
-    # it contains keys including 'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'
-    try: 
-        df = get_data(ticker, end_date=end_date)
-        if not df.empty:
-            my_d = {
-                'ohlcv': df.copy(),
-                'data_as_of': df.index.max().isoformat()
-            }
+        # Before 4:30 PM, go back one weekday
+        if weekday == 0:  # Monday before cutoff
+            return (now - timedelta(days=3)).date()  # last Friday
         else:
-            print(f"{ticker} returned empty data.")
-            return None
-    except Exception as e:
-        print(f"{ticker} failed with: {e}")
-        return None
+            return (now - timedelta(days=1)).date()
 
-    # data wrangling
-
-    df = create_target_long(df)
-    df = feature_engineering(df)
-    df = feature_engineering_add_macro(df, 'spy')
-    df = feature_engineering_add_macro(df, 'qqq')
-    df.dropna(inplace=True)
-    df_date_max = df.index.max()
-
-    X = df.drop(columns = ['target_long','ticker'])
-    y = df['target_long']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    train_len = len(y_train)
-    y_train_pos = y_train.sum()
-    y_train_neg = train_len - y_train_pos
     
-    my_d['prepped_data'] = {
+
+def split_4types(df_prepped,split_type):
+    # make sure no NaN 
+    df = df_prepped.dropna()
+    X = df.drop(columns='target_long')
+    y = df['target_long']
+
+    # type can only be 1,2,3,4
+    if split_type == 1: 
+        # will be used in global: 
+        # criteria: since < 2016-01-01 and is_sp500
+        # if selected, train up to 2020-12-31 (guaranteed 5 years of train data)
+        # val 2021-2022, test 2023 onwards
+        X_train = X.copy()[:'2020-12-31']
+        y_train = y.copy()[:'2020-12-31']
+        X_val = X.copy()['2021-01-01':'2022-12-31']
+        y_val = y.copy()['2021-01-01':'2022-12-31']
+        X_test = X.copy()['2023-01-01':]
+        y_test = y.copy()['2023-01-01':]
+    elif split_type == 2:
+        # not used in global while having sufficient data
+        # criteria: since < 2018-01-01 (guaranteed 5 years of data)
+        # train up to 2022-12-31, test 2023 onwards
+        X_train = X.copy()[:'2022-12-31']
+        y_train = y.copy()[:'2022-12-31']
+        X_val = None
+        y_val = None
+        X_test = X.copy()['2023-01-01':]
+        y_test = y.copy()['2023-01-01':]
+    elif split_type == 3:
+        # less data but has at least 5 years of data up to 2025-06-30
+        # train exactly 5 years of data, test rest
+        train_end = X.index.min() + pd.DateOffset(years=5)
+        test_start = train_end + pd.DateOffset(days=1)
+        X_train = X.copy()[:train_end]
+        y_train = y.copy()[:train_end]
+        X_val = None
+        y_val = None
+        X_test = X.copy()[test_start:]
+        y_test = y.copy()[test_start:]
+    elif split_type == 4: # type 4
+        # no sufficient data, do not split
+        # for prediction simply use the global model to predict
+        X_train = None
+        y_train = None
+        X_val = None
+        y_val = None
+        X_test = None
+        y_test = None
+    else:
+        raise ValueError("type must be 1, 2, 3, or 4")
+    return {
         'X': X,
         'y': y,
-        'y_neg%': len(y[y == 0]) / len(y),
-        'y_pos%': len(y[y == 1]) / len(y),
         'X_train': X_train,
-        'X_test': X_test,
         'y_train': y_train,
-        'y_test': y_test,
-        'y_train_pos': y_train_pos, # flag if less than 100
-        'y_train_neg': y_train_neg, # flag if less than 100
-        'train_len': train_len # flag if training rows less than 252 (a year)
+        'X_val': X_val,
+        'y_val': y_val,
+        'X_test': X_test,
+        'y_test': y_test
     }
 
-    # add a small dataset warning 
-    # flag if any of the three below is False
-    my_d['small_train_set'] = any([
-        train_len < 252,
-        y_train_pos < 100,
-        y_train_neg < 100
-    ])
 
-    # train
-    if use_model is None: 
-        print('training rscv (with scaled class weights)...')
-        fitted_train = train_rscv(X_train, y_train, drop_feats, n_iter=30)
-        my_d['train_set_model'] = {
-            'model': fitted_train,
-            'best_estimator': fitted_train.best_estimator_,
-            'best_params': fitted_train.best_params_,
-            'best_score': fitted_train.best_score_,
-        }
-        print('rscv trained, best params found. now backtesting...')
-        # pred and backtest
 
-        df_trade, trade_stats = backtest(X_test, fitted_train, **backtest_config)
-        total_trading_days = trade_stats['total_trading_days']
+# =====================
+# ||                 ||
+# ||   update data   ||
+# ||                 ||
+# =====================
 
-        my_d['test_set_result'] = {
-            'backtest_config': backtest_config,
-            **trade_stats,
-            'cagr': get_cagr(df_trade),
-            'sharpe': get_sharpe(df_trade, total_trading_days)
-        }
-        # trade states:
-            # 'exit_reason_spread'
-            # 'holding_days_spread'
-            # 'total_trading_days'
-            # 'total_holding_days'
-            # 'holding_time_percentage'
-            # 'n_trades'
-            # 'n_wins'
-            # 'win_rate'
-
-        print('backtesting done. now train the final model...')
-        # train the final model on all data
-        final_model = train_with_best_param(X, y, drop_feats, fitted_train)
-        my_d['final_model'] = final_model
-        my_d['final_model_data_up_to'] = df_date_max.isoformat()
-        my_d['last_update'] = datetime.today()
-
-        print("\n" + "="*30)
-        print(f"🐣{ticker} model ready LFG🗣️🗣️🗣️")
-        print("="*30 + "\n")
-
-    else:
-        if set(use_model.keys()) == {'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'}:
-            my_d.update(use_model)
-        else: 
-            raise KeyError("keys in use_model (a dict) not matched")
-
-    return my_d
-
-# -----
-
-def update_dfs(
-        watchlist=watchlist, 
-        dfs = None,
-        tickers_to_retrain=None, 
+def update_data_pkl(
+        watchlist = watchlist, # note: sp500 tickers will be automatically added
+        data = None,
         end_date = None,
-        load_existing=True,
-        force_retrain=False,
-        update_without_retrain=False,
+        include_all_sp500_in_watchlist = False,
+        reselect_global_candidates = False, # set to False to avoid reselection
+        path = "files/data.pkl",
+        global_candidates_path = "files/df_global_candidates.pkl",
+        redo = False, # will update all data; otherwise only add missing data
+        **kwargs, # for target creation i.e. wrangling_config
 ):
-    if load_existing:
-        dfs = load_dfs()
-    elif dfs is None: 
-        dfs = {}
+    wrangling_params = {**wrangling_config, **kwargs}
 
+    if data is None:
+        data = read_pkl(path, redo)  # will handle `not os.path.exists(path)` too
     if end_date is None:
-        end_date = datetime.today().date() - timedelta(days=((datetime.today().date().weekday() - 6) % 7 or 7))
-    print(f"model will be trained based on data on and before {end_date}")
-
-    tickers_to_retrain = tickers_to_retrain or []
-    tickers_trained_this_time = []
-
-    if any(
-        x is not None and not isinstance(x, (list, tuple))
-        for x in [watchlist, tickers_to_retrain]
-    ):
-        raise TypeError("watchlist and tickers_to_retrain must be list or tuple (or None).")
-
-    skipped = []
-    failed = []
-
-    for idx, ticker in enumerate(watchlist):
-        print(f"{ticker} out of {idx+1}/{len(watchlist)} tickers...")
-
-        if ticker in tickers_to_retrain:  # should always train
-            print(f"{ticker} explicitly retraining...")
-            result = build_dict(ticker, end_date)
-            if result:
-                dfs[ticker] = result
-                tickers_trained_this_time.append(ticker)
-            else:
-                print(f"{ticker} not proceesed due to data issue.")
-                failed.append(ticker)
-        elif ticker in dfs and not force_retrain:
-            if update_without_retrain:
-                subset_keys = {'train_set_model', 'test_set_result', 'final_model', 'final_model_data_up_to', 'last_update'}
-                use_model = {k: dfs[ticker][k] for k in subset_keys}
-                result = build_dict(ticker, end_date, use_model=use_model)
-                if result:
-                    dfs[ticker] = result
-            else:
-                print(f"{ticker} skipped (last updated at {dfs[ticker]['last_update']}).")
-                skipped.append(ticker)
-                continue
-        else:  # should train
-            print(f"{ticker} training (new or forced)...")
-            result = build_dict(ticker, end_date)
-            if result:
-                dfs[ticker] = result
-                tickers_trained_this_time.append(ticker)
-            else:
-                print(f"{ticker} not proceesed due to data issue.")
-                failed.append(ticker)
-
-    if len(skipped)>0:
-        if len(skipped)<=10:
-            print(f"skipped ticker: {skipped}")
-        else: 
-            print(f"number of skipped tickers: {len(skipped)}")
-    if len(failed)>0:
-        print(f"failed ticker: {failed}")
-
-    dfs['metadata'] = {
-        'num_tickers': sum(1 for k in dfs if k != 'metadata'),
-        'last_params': {
-            'watchlist': watchlist,
-            'end_date': end_date or 'default',
-            'force_retrain': force_retrain,
-            'tickers_to_retrain': tickers_to_retrain,
-        },
-        'last_updated_tickers': tickers_trained_this_time, 
-        'last_updated_at': datetime.today().isoformat(),
-    }
-
-    save_dfs(dfs)
-    return dfs
-
-    
-
-# -----
-
-def run_pred(ticker, model = None, model_date = None, start_date = None, end_date = None): 
-    if model is None: 
-        dfs = load_dfs() 
-        model = dfs[ticker]['final_model']
-        model_date = dfs[ticker]['final_model_data_up_to']
-
-    if start_date is None:
-        year_ahead = date.today() - timedelta(days=365)
+        end_date = get_available_date()
     else:
-        year_ahead = datetime.strptime(start_date, "%Y-%m-%d").date() - timedelta(days=365)
+        print(f"update data up to {end_date}")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d").date() if isinstance(end_date, str) else end_date
 
-    # get at least a year of data; get_data also handles end_date to be inclusive already
-    data = get_data(ticker, start_date = year_ahead, end_date = end_date)
-    if data is None or len(data)==0:
-        print('no data queried from yfinance')
-        return 0
-    
-    most_recent_date = data.index.max().isoformat()
+    etfs = make_market_trend_dict()
 
-    data = feature_engineering(data)
-    data = feature_engineering_add_macro(data, 'spy')
-    data = feature_engineering_add_macro(data, 'qqq')
+    # get the df for selected global candidates 
+    # this df contains the exact sp500 tickers
+    df_global_candidates = select_global_candidates(
+        path = global_candidates_path,
+        redo = reselect_global_candidates
+    )
 
-    if start_date is None and end_date is None:
-        data_to_pred = data[most_recent_date:most_recent_date]
-    elif end_date is None: # has start date but no end date 
-        data_to_pred = data[start_date:most_recent_date]
-    elif start_date is None: # has end date but no start date 
-        data_to_pred = data[end_date:end_date]
-    else:
-        data_to_pred = data[start_date:end_date]
+    ls_sp500 = df_global_candidates['ticker'].tolist()
+    ls_global_candidates = df_global_candidates.loc[
+        df_global_candidates['selected'], 'ticker'
+    ].tolist()
 
-    if model_date is not None and data_to_pred.index.min() <= pd.Timestamp(model_date):
-        print(f"WARNING: this model (uses data up to {model_date.isoformat()})"
-              f"should not be used to predict data from {data_to_pred.index().min().isoformat()}"
-              f"to {model_date.isoformat()}")
-        return None
-    elif model_date is None: 
-        print("WARNING: make sure model was not trained on any data using for prediction here!")
-    
-    if data_to_pred.isna().any().any(): 
-        print('WARNING: NaN value detected in data')
+    # make sure everything is lowercase 
+    ls_sp500 = [i.lower() for i in ls_sp500]
+    ls_global_candidates = [i.lower() for i in ls_global_candidates]
+    watchlist = [i.lower() for i in watchlist]
 
-    y_hardpred = model.predict(data_to_pred)
-    y_softpred = model.predict_proba(data_to_pred)[:,1]
-
-    my_d = {
-        'ticker': [ticker] * len(y_hardpred),
-        'date': pd.to_datetime(data_to_pred.index),
-        'pred': y_hardpred, # should enter at open the next day?
-        'proba': y_softpred,
-        '→': [None] * len(y_hardpred), # indicates that most recent data (e.g., today after market close) is shown on the right
-        'atr': data_to_pred['atr'], # atr as of the date
-        'garch_vol%': data_to_pred['garch_vol'], # garch volatility in % as of the date 
-        'sma30': data_to_pred['sma30'], # sma30 as of the date
-        'open': data_to_pred['open'],
-        'close': data_to_pred['close']
-    }
-
-    return pd.DataFrame(my_d) # no (meaning default) index
-
-
-def run_pred_dfs(
-    tickers=watchlist,
-    dfs=None,
-    start_date=None, 
-    end_date=None,
-    load_existing=True
-):
-    if load_existing:
-        dfs = load_dfs()
-    elif dfs is None:
-        raise ValueError("No data provided (dfs is None).")
-
-    if not isinstance(tickers, (list, tuple)):
-        raise TypeError("tickers must be a list or tuple.")
-
-    df_all = []
-    for t in tickers:
-        if t not in dfs:
-            print(f"{t} not found in dfs — skipping.")
-            continue
-        model = dfs[t]['final_model']
-        model_date = dfs[t]['final_model_data_up_to']
-        df_pred = run_pred(t, model, model_date, start_date, end_date)
-        df_all.append(df_pred)
-
-    if df_all:
-        return pd.concat(df_all).set_index('ticker')
-    else:
-        return pd.DataFrame()
-
-
-# -----
-
-def check(
-        dfs=None, 
-        start_date=None,
-        end_date=None,
-        load_existing=True, 
-        with_pred=True,
-        print_df=True,
-        save_csv=True
-):
-    print("checking...")
-    if load_existing:
-        dfs = load_dfs()
-    elif dfs is None:
-        print("no data available (dfs is None)")
-        return None
-
-    # ---- Collect backtest stats ----
-    my_d = {}
-    for k, v in dfs.items():
-        if k=='metadata':
-            continue
-        my_d[k] = {
-            'total_trading_days': v['test_set_result']['total_trading_days'],
-            'holding_time%': v['test_set_result']['holding_time_percentage'],
-            'n_trades': v['test_set_result']['n_trades'],
-            'win%': v['test_set_result']['win_rate'],
-            'cagr': v['test_set_result']['cagr'],
-            'sharpe': v['test_set_result']['sharpe'],
-        }
-
-    if len(my_d) == 0:
-        print('empty dfs, no backtest result and prediction can be shown')
-        return None
-    
-    df_stats = pd.DataFrame.from_dict(my_d, orient='index')
-    df_stats.index.name = 'ticker'
-
-    # ---- get prediction ----
-    df_pred = None
-    if with_pred: 
-        df_pred = run_pred_dfs(dfs=dfs, load_existing=False, start_date=start_date, end_date=end_date) 
-        max_date = df_pred['date'].max()
-        df_pred['→→'] = None # indicates that backtest result shows on the right
-        df = df_pred.merge(df_stats, on='ticker', how='left')
-    else: 
-        df = df_stats
-        max_date = None
-
-    # ---- Save prediction DataFrame ----
-    if with_pred and save_csv and df_pred is not None and not df_pred.empty:
-        os.makedirs("predictions", exist_ok=True)
-        df.to_csv(f"predictions/pred_{max_date.date().isoformat()}.csv", index=False)
-        print(f"✅ Predictions saved to predictions/pred_{max_date.date().isoformat()}.csv\n")
-
-    # ---- Display Section ----
-    if print_df:
-        if max_date:
-            print("some col names:\n"
-                  "  pred: the hard binary prediction (threshold=0.5) of whether should long tomorrow\n"
-                  "  →: most recent data (e.g., up to today after market close)\n"
-                  "  Gv%: garch(1,1) volatility (%)\n"
-                  "  open: today open price\n"
-                  "  close: today close\n"
-                  "  →→: backtest result (from test set)\n"
-                  "  ttd: total trading days (=len(X_test))\n"
-                  "  ht% : hodling time (%)\n"
-                  "  nt: number of trades")
-
-
-            # for those with hard pred == 1,
-            # should pose warning if any ticker has train set rows less than 252 / each of the y train classes (1/0) less than 100
-            true_tickers = set(df[df['pred']==True].index)
-            small_train_set = []
-            for i in true_tickers:
-                if dfs[i]['small_train_set']:
-                    small_train_set.append(i)
-            if len(small_train_set)>0:
-                print(f"WARNING: small training set (has <252 rows / <100 pos or neg class) used for backtesting:\n"
-                      f"{small_train_set}")
-
-            print(f"predicted on data on/up to {max_date.isoformat()}:")
-            if len(df['date'].unique()) == 1:
-                df.drop(columns=['date'], inplace=True)
-        else:
-            print(f"only backtest metrics:")
+    if include_all_sp500_in_watchlist:
+        watchlist = list(set(watchlist + ls_sp500))
+    else: # only the selected ones (essential for global model)
+        watchlist = list(set(watchlist + ls_global_candidates))
         
-        # Format metrics for printing
-        if 'proba' in df.columns:
-            df['proba'] = df['proba'].apply(lambda x: f"{x:.2%}")
-        if 'atr' in df.columns:
-            df['atr'] = df['atr'].apply(lambda x: f"{x:.2f}")
-        if 'garch_vol%' in df.columns:
-            df['garch_vol%'] = df['garch_vol%'].apply(lambda x: f"{x:.2f}")
-        if 'sma30' in df.columns:
-            df['sma30'] = df['sma30'].apply(lambda x: f"{x:.2f}")
-        if 'holding_time%' in df.columns:
-            df['holding_time%'] = df['holding_time%'].apply(lambda x: f"{x:.2%}")
-        if 'win%' in df.columns:
-            df['win%'] = df['win%'].apply(lambda x: f"{x:.2%}")
-        if 'cagr' in df.columns:
-            df['cagr'] = df['cagr'].apply(lambda x: f"{x:.2%}")
-        if 'sharpe' in df.columns:
-            df['sharpe'] = df['sharpe'].apply(lambda x: f"{x:.3f}")
+    print(f"total number of tickers to process: {len(watchlist)}")
 
-        df.sort_values(by=['pred','proba'],ascending=False, inplace=True)
 
-        for_print = df.rename(columns={
-            'garch_vol%': 'Gv%',
-            'total_trading_days': 'ttd',
-            'holding_time%': 'ht%',
-            'n_trades': 'nt'
-        })
-        for_print.index.name = 'tkr'
-        print(tabulate(for_print, headers='keys', tablefmt='fancy_grid'))
+    any_update = False
+    # only update the data specifried by watchlist; keep existing
+    with tqdm(watchlist, desc="Processing tickers", leave=True) as pbar:
+        for i in pbar:
+            # always show which ticker we're touching
+            pbar.set_postfix_str(f"Last: {i}")
 
-    return None
+            # skip if already up-to-date
+            if (
+                i in data
+                and data[i].get('as_of', None) is not None
+                and data[i]['as_of'] >= end_date
+            ):
+                continue
+
+            try:
+                any_update = True
+                # --- CREATE or UPDATE OHLCV ---
+                if i not in data:
+                    ohlcv = get_data(i, start_date='1999-01-01', end_date=end_date)
+                    prepped = wrangling(
+                        ohlcv,
+                        etfs=etfs,
+                        sp500_tickers=ls_sp500,
+                        **wrangling_params
+                    )
+
+                    since = ohlcv.index.min().date()
+                    sector = prepped['sector'].iloc[0]
+                    use_in_global = i in ls_global_candidates
+                
+                    # split type and split data 
+                    if use_in_global:
+                        split_type = 1 # use in global model
+                    elif since < datetime.strptime("2018-01-01", "%Y-%m-%d").date():
+                        split_type = 2  # train up to 2022-12-31 and rest is test
+                    elif since < datetime.strptime("2020-06-30", "%Y-%m-%d").date():
+                        split_type = 3  # use exactly 5yrs of data as train and rest is test
+                    else: 
+                        split_type = 4 # no sufficient data, do not split
+
+                    split = split_4types(prepped,split_type)
+
+                    data[i] = {
+                        'ohlcv': ohlcv,
+                        'as_of': ohlcv.index.max().date(),
+                        'prepped': prepped,
+                        'target_kwargs': {**wrangling_params}, 
+                        'since': since,
+                        'sector': sector,
+                        'use_in_global': use_in_global,
+                        'split_type': split_type,
+                        'split': split
+                    }
+
+
+                else:
+                    # check if there is new data, if not then skip
+                    as_of = data[i]['as_of']
+                    start_date = as_of + timedelta(days=1)
+                    if start_date > end_date:
+                        continue
+                    new_ohlcv = get_data(i, start_date=start_date, end_date=end_date)
+                    if new_ohlcv.empty:
+                        continue
+
+                    ohlcv = pd.concat([data[i]['ohlcv'], new_ohlcv])
+                    ohlcv = ohlcv[~ohlcv.index.duplicated(keep='last')].sort_index()
+
+                    # although not efficient, recalculate everything for now to ensure consistency
+                    # caveats if not recalculating:
+                    # 1) GARCH needs full history (and this takes most of the processing time)
+                    # 2) cannot get the correct year_since unless modify the feature_engineering function
+                    prepped = wrangling(
+                        ohlcv,
+                        etfs=etfs,
+                        sp500_tickers=ls_sp500,
+                        **wrangling_params
+                    )
+
+                    data[i] |= {
+                        'ohlcv': ohlcv,
+                        'as_of': ohlcv.index.max().date(),
+                        'prepped': prepped,
+                    }
+
+                    new_start_idx = new_ohlcv.index.min()
+                    new_prepped = prepped[new_start_idx:].dropna()
+                    X_new_prepped = new_prepped.drop(columns='target_long')
+                    y_new_prepped = new_prepped['target_long']
+                    X = pd.concat([data[i]['split']['X'], X_new_prepped])
+                    y = pd.concat([data[i]['split']['y'], y_new_prepped])
+                    X = X[~X.index.duplicated(keep='last')].sort_index()
+                    y = y[~y.index.duplicated(keep='last')].sort_index()
+
+                    data[i]['split'] |= {
+                        'X': X,
+                        'y': y,
+                    }
+
+                    if data[i]['split_type'] in (1,2,3): 
+                        X_test = pd.concat([data[i]['split']['X_test'], X_new_prepped])
+                        y_test = pd.concat([data[i]['split']['y_test'], y_new_prepped])
+                        X_test = X_test[~X_test.index.duplicated(keep='last')].sort_index()
+                        y_test = y_test[~y_test.index.duplicated(keep='last')].sort_index()
+
+                        data[i]['split'] |= {
+                            'X_test': X_test,
+                            'y_test': y_test
+                        }
+
+                    # for type 1 and 2, if use_in_global changed due to reselection
+                    # then should resplit train and val sets
+                    if (
+                        reselect_global_candidates 
+                        and data[i]['split_type'] in (1,2)
+                        and (i in ls_global_candidates) != data[i]['use_in_global']
+                    ):
+                        use_in_global = i in ls_global_candidates
+                        data[i]['use_in_global'] = use_in_global
+                        if use_in_global:
+                            split_type = 1
+                        else:
+                            split_type = 2
+                        split = split_4types(data[i]['prepped'],split_type)
+                        data[i]['split_type'] = split_type
+
+            except Exception as e:
+                pbar.write(f"[ERROR] {i}: {e}")
+                traceback.print_exc()
+                if i in data:
+                    del data[i]
+                continue
+
+    if any_update:
+        print('data done. saving...')
+        save_pkl(path, data)
+    return data
+
+
+
+
+# ===================================
+# ||                               ||
+# ||   train models and backtest   ||
+# ||                               ||
+# ===================================
+def update_models_pkl(
+        watchlist = watchlist, # indiv models trained based on this
+        models = None,
+        data = None,
+        update_data = True, # new data comes in everyday
+        update_global = False, # frozen
+        update_indiv = False, # frozen (end date depends on split type)
+        update_indiv_fullset = True, # new data comes in everyday
+        update_stack = False, # frozen
+        update_backtest = True,
+        reselect_global_candidates = False,
+        redo = False,
+        models_path = 'files/models.pkl',
+        data_path = 'files/data.pkl',
+        metrics_path = 'files/metrics.pkl',
+):
+    if models is None:
+        models = read_pkl(models_path, redo=redo)
+    for i in ['global', 'indiv_trainset', 'indiv_fullset']:
+        if i not in models:
+            models[i] = {}
+    if redo: 
+        update_global = True
+        update_indiv = True
+        update_indiv_fullset = True
+        update_stack = True
+        update_backtest = True
+
+
+    # whether to use up to latest data
+    if data is None: 
+        if update_data:
+            print('updating data...')
+            data = update_data_pkl(
+                watchlist = watchlist,
+                reselect_global_candidates=reselect_global_candidates
+            )
+        else: 
+            print('gathering data without updating...')
+            data = read_pkl(data_path, redo=False)
+
+    # retain a copy of global tickers
+    use_in_global_tickers = []
+    for k,v in data.items():
+        if v.get('use_in_global', False):
+            use_in_global_tickers.append(k)
+
+    watchlist = list(set(watchlist + use_in_global_tickers))
+
+    if update_global: 
+        X_train_global, y_train_global = [], []
+        drop_feats_global = get_drop_feats_global()
+        ohe_feats = get_ohe_feats()
+        pipe_global = get_pipeline_global(drop_feats_global, ohe_feats)
+        for k,v in data.items():
+            if v.get('use_in_global', False):
+                X_train_global.append(v['split']['X_train'])
+                y_train_global.append(v['split']['y_train'])
+        print(f"training global model with {len(use_in_global_tickers)} tickers...")
+        X_train_global = pd.concat(X_train_global)
+        y_train_global = pd.concat(y_train_global)
+
+        rscv_global = train_rscv(X_train_global, y_train_global, pipe_global)
+        models['global'] = {
+            'model': rscv_global,
+            'trained_on': datetime.now().date(), # call it trained_on instead of as_of
+            'data_as_of': X_train_global.index.max().date(),
+        }
+        print("global model done. saving models...")
+        save_pkl(models_path, models)
+        print('saving global done')
+
+    if update_indiv:
+        drop_feats_indiv = get_drop_feats_indiv()
+        pipe_indiv = get_pipeline_indiv(drop_feats_indiv)
+        print(f"amount of indiv models: {len(watchlist)}")
+        
+        with tqdm(watchlist, desc="training indiv models", leave=True) as pbar:
+            for t in pbar:
+                if t not in data:
+                    tqdm.write(f"[ERROR] {t} not in data.pkl")
+                    continue
+                if data[t]['split_type'] == 4:
+                    tqdm.write(f"Skipping {t} due to insufficient data")
+                    continue
+
+                if (
+                    t in models['indiv_trainset']
+                    and models['indiv_trainset'][t]['data_as_of'] == data[t]['split']['X_train'].index.max().date()
+                ): 
+                    pbar.set_postfix_str(f"{t} has up-to-date indiv_trainset; checking fullset...")
+                else: 
+                    pbar.set_postfix_str(f"training {t} indiv_trainset...")
+                    X_train = data[t]['split']['X_train']
+                    y_train = data[t]['split']['y_train']
+                    if any([
+                    X_train is None,
+                    X_train.empty,
+                    y_train is None,
+                    y_train.empty,
+                    ]):
+                        pbar.set_postfix_str(f"Skipping {t} due to missing data")
+                        continue
+                    pbar.set_postfix_str(f"Training {t}")
+                    rscv_indiv = train_rscv(X_train, y_train, pipe_indiv)
+                    models['indiv_trainset'][t] = {
+                        'model': rscv_indiv,
+                        'trained_on': datetime.now().date(),
+                        'data_as_of': X_train.index.max().date(),
+                    }
+                    pbar.set_postfix_str(f"Finished training {t} indiv_trainset.")
+
+                if update_indiv_fullset: 
+                    # X_all = data[t]['prepped'].dropna().drop(columns='target_long')
+                    # y_all = data[t]['prepped'].dropna()['target_long']
+                    X_all = data[t]['split']['X']
+                    y_all = data[t]['split']['y']
+                    if y_all.isnull().any(): # won't run into type 4
+                        raise ValueError(f"y_all for {t} contains NaN")
+                    rscv_indiv = models['indiv_trainset'][t]['model']
+                    rscv_all = train_with_best_param(X_all, y_all, pipe_indiv, rscv_indiv)
+                    models['indiv_fullset'][t] = {
+                        'model': rscv_all,
+                        'trained_on': datetime.now().date(),
+                        'data_as_of': X_all.index.max().date(), # only a single 'as_of' without 'data_as_of'
+                    }
+
+        print("indiv models done. saving models...")
+        save_pkl(models_path, models)
+        print('saving indiv done')
+
+    if update_stack: 
+        # make sure all indiv and global models are trained 
+        # add a property as_of to each indiv so that can make sure not to retrain if not needed
+        print("training stack model...")
+        if 'global' not in models or 'indiv_trainset' not in models:
+            raise ValueError("Please train indiv and global models before training stack model")
+        if 'stack' not in models:
+            models['stack'] = None
+        global_model = models['global']['model']
+        X_stack = []
+        y_stack = []
+        for t in use_in_global_tickers:
+            if t not in models['indiv_trainset']:
+                raise ValueError(f"Please train indiv model for {t} before training stack model")
+            if any([
+                data[t]['split']['X_val'] is None,
+                data[t]['split']['X_val'].empty,
+                data[t]['split']['y_val'] is None,
+                data[t]['split']['y_val'].empty,
+            ]):
+                raise ValueError(f"Please make sure {t} has a validation set before training stack model")
+            # if models['indiv_trainset'][t]['as_of'] != models['global']['as_of']:
+            #     raise ValueError(f"Please retrain indiv model for {t} / global model to match before training stack model")
+            indiv_model = models['indiv_trainset'][t]['model']
+
+            X_val = data[t]['split']['X_val']
+            y_val = data[t]['split']['y_val']
+
+            y_proba_global = global_model.predict_proba(X_val)[:, 1]
+            y_proba_indiv = indiv_model.predict_proba(X_val)[:, 1]
+            df_proba_val = pd.DataFrame({
+                'global_proba': y_proba_global,
+                'indiv_proba': y_proba_indiv
+            }, index=X_val.index)
+            
+            X_stack.append(df_proba_val)
+            y_stack.append(y_val)
+        X_stack = pd.concat(X_stack)
+        y_stack = pd.concat(y_stack)
+        lr = LogisticRegression()
+        lr.fit(X_stack, y_stack)
+        models['stack'] = {
+            'model': lr,
+            'trained_on': datetime.now().date(),
+            'data_as_of': y_stack.index.max().date(),
+        }
+        print("stack model done")
+
+    
+    if update_backtest: 
+        metrics = {
+            'backtested': {},
+            'skipped': [],
+            'backtest_config': {
+                'cat1': backtest_config_1,
+                'cat2': backtest_config_2,
+                'cat3': backtest_config_3,
+            },
+            'last_updated': datetime.now().date()
+        }
+        skip_backtest_tickers = []
+        for t in tqdm(watchlist, desc="backtesting"):
+            split_type = data[t]['split_type']
+            if split_type == 4:
+                tqdm.write(f"Skipping {t} due to insufficient data (type 4)") #TODO do we want to pred with global using the whole set?
+                skip_backtest_tickers.append(t)
+                continue
+
+
+            X_test = data[t]['split']['X_test']
+            y_test = data[t]['split']['y_test']
+
+            if any([
+                X_test is None,
+                X_test.empty,
+                y_test is None,
+                y_test.empty,
+            ]):
+                tqdm.write(f"Skipping {t} due to missing test data")
+                skip_backtest_tickers.append(t)
+                continue
+
+            if split_type == 1:
+                backtest_config = backtest_config_1
+            elif split_type == 2:
+                backtest_config = backtest_config_2
+            elif split_type == 3:
+                backtest_config = backtest_config_3
+
+            global_model = models['global']['model']
+            y_proba_global = global_model.predict_proba(X_test)[:, 1]
+            if t in models['indiv_trainset']:
+                indiv_model = models['indiv_trainset'][t]['model']
+                y_proba_indiv = indiv_model.predict_proba(X_test)[:, 1]
+                df_proba_test = pd.DataFrame({
+                    'global_proba': y_proba_global,
+                    'indiv_proba': y_proba_indiv
+                }, index=X_test.index)
+                backtest_model = models['stack']['model']
+            else: 
+                df_proba_test = pd.DataFrame({
+                    'global_proba': y_proba_global,
+                }, index=X_test.index)
+                backtest_model = models['global']['model']
+            
+            _, trade_stats = backtest(
+                X_backtest_input = X_test,
+                model = backtest_model,
+                **backtest_config,
+                X_model_input=df_proba_test
+            )
+
+            threshold = backtest_config['proba_threshold']
+            y_final_proba = backtest_model.predict_proba(df_proba_test)[:, 1]
+            y_final_pred = pred_proba_to_signal(y_final_proba, threshold)
+
+            precision = precision_score(y_test, y_final_pred)
+            recall = recall_score(y_test, y_final_pred)
+            prevalence = y_test.mean()
+
+            metrics['backtested'][t] = {
+                'precision': precision,
+                'recall': recall,
+                'prevalence': prevalence,
+                **trade_stats,
+                'cat': split_type,
+            }
+
+        metrics['skipped'] = skip_backtest_tickers
+        save_pkl(metrics_path, metrics)
+
+    save_pkl(models_path, models)
+    return models
+
+
+
+# ========================
+# ||                    ||
+# ||   check backtest   ||
+# ||                    ||
+# ========================
+
+def check_backtest(tickers: Iterable[str] = None, metrics_path = 'files/metrics.pkl'):
+    if os.path.exists(metrics_path):
+        metrics = read_pkl(metrics_path, redo=False)
+        if tickers is None: # or not none
+            ...
+        if metrics:
+            df_metrics = pd.DataFrame(metrics['backtested']).T
+            df_metrics = df_metrics.rename(columns={
+                'total_trading_days': 'd_trade',
+                'total_holding_days': 'd_hold',
+                'holding_time_percentage': 'd_%',
+                'expectancy': 'exp'
+            })
+
+            if tickers is not None:
+                # accept a single string too
+                if isinstance(tickers, str):
+                    tickers = [tickers]
+                # keep only those present; preserves the input order
+                present = [t for t in tickers if t in df_metrics.index]
+                df_metrics = df_metrics.loc[present]
+
+            print(tabulate(df_metrics, headers='keys', tablefmt='psql', floatfmt=".4f"))
+            print("cat legend:\n"
+                  "1 = used in global and stack; stacked results from indiv (trained with 5+ years) & global (in-sample); complete test set starting 2023-01-01\n"
+                  "2 = not used in global; stacked results from indiv (trained with 5+ years) & global (out-of-sample); complete test set starting 2023-01-01\n"
+                  "3 = not used in global; stacked results from indiv (trained with 5 years) & global (out-of-sample); shortened test set\n"
+            )
+            print(f"cat 4 aka skipped tickers due to insufficient data: {metrics.get('skipped', [])}")
+            print(f"backtest config: {metrics.get('backtest_config', {})}")
+        else:
+            print("No metrics found in metrics.pkl")
+    else:
+        print("metrics.pkl not found. Please run update_models_pkl with update_backtest=True first.")
+
+            
+
+# ============================================
+# ||                                        ||
+# ||   run pred and show backtest results   ||
+# ||                                        ||
+# ============================================
+
+def run_pred(
+        watchlist = watchlist,
+        data = None, 
+        models = None, 
+        metrics = None,
+        show_all = False,
+        cutoff = 0.5,
+        # date = None, # right now only run the last available row of data only
+        models_path = "files/models.pkl",
+        metrics_path = "files/metrics.pkl"
+):
+    if data is None: 
+        data = update_data_pkl() # always update data 
+    if models is None: 
+        models = read_pkl(models_path, redo=False)
+    if metrics is None: 
+        metrics = read_pkl(metrics_path, redo=False)
+
+    ls_data_not_available = []
+    d_pred_date = {}
+    results = []
+    for t in watchlist:
+        if t not in data:
+            ls_data_not_available.append(t)
+            continue
+        to_pred = data[t]['prepped'].tail(1).drop(columns='target_long')
+        pred_date = to_pred.index[0]
+        if pred_date not in d_pred_date:
+            d_pred_date[pred_date] = [t]
+        d_pred_date[pred_date].append(t)
+
+        if data[t]['split_type'] == 4:
+            model = models['global']['model']
+            proba_gonly = model.predict_proba(to_pred)[:, 1]
+            results.append({
+                'ticker': t,
+                'proba_sfull': None,
+                'proba_strain': None,
+                'proba_g': proba_gonly[0],
+                'proba_ifull': None,
+                'proba_itrain': None,
+                'cat': 4,
+            })
+        else:
+            model_global = models['global']['model']
+            model_indiv_full = models['indiv_fullset'][t]['model']
+            model_indiv_train = models['indiv_trainset'][t]['model']
+            proba_g = model_global.predict_proba(to_pred)[:, 1]
+            proba_ifull = model_indiv_full.predict_proba(to_pred)[:, 1]
+            proba_itrain = model_indiv_train.predict_proba(to_pred)[:, 1]
+            stack = models['stack']['model']
+            proba_sfull = stack.predict_proba(pd.DataFrame({
+                'global_proba': proba_g,
+                'indiv_proba': proba_ifull
+            }, index=to_pred.index))[:, 1]
+            proba_strain = stack.predict_proba(pd.DataFrame({
+                'global_proba': proba_g,
+                'indiv_proba': proba_itrain
+            }, index=to_pred.index))[:, 1]
+            results.append({
+                'ticker': t,
+                'proba_sfull': proba_sfull[0],
+                'proba_strain': proba_strain[0],
+                'proba_g': proba_g[0],
+                'proba_ifull': proba_ifull[0],
+                'proba_itrain': proba_itrain[0],
+                'cat': data[t]['split_type'],
+            })
+    df_results = pd.DataFrame(results).set_index('ticker').sort_values(by='proba_sfull', ascending=False)
+
+    if ls_data_not_available:
+        print(f"Data not available for the following tickers: {', '.join(ls_data_not_available)}")
+    if len(d_pred_date) == 1:
+        print(f"prediction of data on {list(d_pred_date.keys())[0]}")
+    else: 
+        print('inconsistent data dates:')
+        print(d_pred_date)
+
+    if show_all:
+        print(tabulate(df_results, headers='keys', tablefmt='psql', floatfmt=".4f"))
+        print("please check individual backtest result by calling check_backtest([tickers])")
+    else: 
+        proba_cols = ["proba_sfull", "proba_strain", "proba_g", "proba_ifull", "proba_itrain"]
+        df_filtered = df_results[(df_results[proba_cols] >= cutoff).all(axis=1)]
+        print(tabulate(df_filtered, headers='keys', tablefmt='psql', floatfmt=".4f"))
+        tickers = df_filtered.index.tolist()
+        print("\n" + "="*20 + " BACKTEST RESULTS " + "="*20)
+        print("╔" + "═"*58 + "╗")
+        print("║{:^58s}║".format("BACKTEST SUMMARY"))
+        print("╚" + "═"*58 + "╝\n")
+        check_backtest(tickers)

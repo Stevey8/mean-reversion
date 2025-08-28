@@ -12,6 +12,7 @@ data/
 logs/
 results/
 .vscode/
+files/
 
 models/
 *.h5
