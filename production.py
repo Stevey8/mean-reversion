@@ -737,42 +737,42 @@ def run_pred(
 
         if data[t]['split_type'] == 4:
             model = models['global']['model']
-            proba_gonly = model.predict_proba(to_pred)[:, 1]
+            p_global = model.predict_proba(to_pred)[:, 1]
             results.append({
                 'ticker': t,
-                'proba_g': proba_gonly[0],
-                'proba_strain': None,
-                'proba_itrain': None,
-                'proba_sfull': None,
-                'proba_ifull': None,
+                'p_global': p_global[0],
+                'p_stack_train': None,
+                'p_indiv_train': None,
+                'p_stack_full': None,
+                'p_indiv_full': None,
                 'cat': '4',
             })
         else:
             model_global = models['global']['model']
             model_indiv_full = models['indiv_fullset'][t]['model']
             model_indiv_train = models['indiv_trainset'][t]['model']
-            proba_g = model_global.predict_proba(to_pred)[:, 1]
-            proba_ifull = model_indiv_full.predict_proba(to_pred)[:, 1]
-            proba_itrain = model_indiv_train.predict_proba(to_pred)[:, 1]
+            p_global = model_global.predict_proba(to_pred)[:, 1]
+            p_indiv_full = model_indiv_full.predict_proba(to_pred)[:, 1]
+            p_indiv_train = model_indiv_train.predict_proba(to_pred)[:, 1]
             stack = models['stack']['model']
-            proba_sfull = stack.predict_proba(pd.DataFrame({
-                'global_proba': proba_g,
-                'indiv_proba': proba_ifull
+            p_stack_full = stack.predict_proba(pd.DataFrame({
+                'global_proba': p_global,
+                'indiv_proba': p_indiv_full
             }, index=to_pred.index))[:, 1]
-            proba_strain = stack.predict_proba(pd.DataFrame({
-                'global_proba': proba_g,
-                'indiv_proba': proba_itrain
+            p_stack_train = stack.predict_proba(pd.DataFrame({
+                'global_proba': p_global,
+                'indiv_proba': p_indiv_train
             }, index=to_pred.index))[:, 1]
             results.append({
                 'ticker': t,
-                'proba_g': proba_g[0],
-                'proba_strain': proba_strain[0],
-                'proba_itrain': proba_itrain[0],
-                'proba_sfull': proba_sfull[0],
-                'proba_ifull': proba_ifull[0],
+                'p_global': p_global[0],
+                'p_stack_train': p_stack_train[0],
+                'p_indiv_train': p_indiv_train[0],
+                'p_stack_full': p_stack_full[0],
+                'p_indiv_full': p_indiv_full[0],
                 'cat': str(data[t]['split_type']),
             })
-    df_results = pd.DataFrame(results).set_index('ticker').sort_values(by='proba_g', ascending=False)
+    df_results = pd.DataFrame(results).set_index('ticker').sort_values(by='p_global', ascending=False)
 
     if ls_data_not_available:
         print(f"Data not available for the following tickers: {', '.join(ls_data_not_available)}")
@@ -788,7 +788,7 @@ def run_pred(
         print("for other tickers please check calling check_backtest(tickers)")
         tickers = df_results.head(20).index.tolist()
     else: 
-        proba_cols = [ "proba_g", "proba_strain", "proba_itrain", "proba_sfull", "proba_ifull"]
+        proba_cols = [ "p_global", "p_stack_train", "p_indiv_train", "p_stack_full", "p_indiv_full"]
         df_filtered = df_results[
             (df_results[proba_cols].ge(cutoff) | df_results[proba_cols].isna()).all(axis=1)
         ]
