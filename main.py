@@ -1,4 +1,5 @@
-from production import update_data_pkl, update_models_pkl, check_backtest as check_backtest_prod, run_pred
+from utils.dataloader import get_sp500, select_global_candidates
+from production import update_data_pkl, update_models_pkl, check_backtest, run_pred
 from config import watchlist
 
 import os
@@ -8,7 +9,7 @@ import warnings
 from zoneinfo import ZoneInfo
 import schedule
 from datetime import time as dt_time, datetime, timedelta
-import time  # <-- the module, for sleep()
+import time  # for sleep()
 
 warnings.filterwarnings("ignore")
 
@@ -18,6 +19,12 @@ MARKET_OPEN  = dt_time(9, 30)   # 9:30am ET
 LOCKFILE = "/tmp/weekly_retraining.lock"
 
 def within_weekend_retrain_window(now: datetime) -> bool:
+    """
+    True if we're in the intended window:
+      - Fri after market close
+      - Any time Sat/Sun
+      - Mon before market open
+    """
     now_et = now.astimezone(TZ)
     wd = now_et.weekday()  # Mon=0..Sun=6
     if wd == 4:  # Fri
@@ -29,6 +36,9 @@ def within_weekend_retrain_window(now: datetime) -> bool:
     return False
 
 def single_run_lock(path=LOCKFILE):
+    """
+    Decorator to ensure only one run at a time via a simple lockfile.
+    """
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -61,10 +71,12 @@ def weekly_retraining():
 def check_backtest_job():
     now = datetime.now(tz=TZ)
     print(f"[check_backtest] {now.isoformat(timespec='seconds')}")
-    check_backtest_prod()
+    check_backtest()
 
 def setup_schedule():
+    # retrain after close on Fridays
     schedule.every().friday.at("17:55").do(weekly_retraining)
+    # backtest checks Sun–Thu after close-ish
     for day in ("sunday", "monday", "tuesday", "wednesday", "thursday"):
         getattr(schedule.every(), day).at("17:55").do(check_backtest_job)
 
@@ -73,13 +85,19 @@ def run_forever():
     print("[scheduler] started")
     while True:
         schedule.run_pending()
-        # sleep a bit; you can also compute next idle seconds if desired
         time.sleep(1)
 
 def main():
     print("Starting scheduler. Press Ctrl+C to stop.\n")
-    print("available: watchlist, update_data_pkl(), update_models_pkl(), check_backtest_prod(), run_pred()")
-    # Start the loop only if not interactive
+    print(
+        "Available names:\n"
+        "  watchlist\n"
+        "  get_sp500(), select_global_candidates()\n"
+        "  update_data_pkl(), update_models_pkl(), check_backtest(), run_pred()\n"
+        "  setup_schedule(), weekly_retraining(), check_backtest_job(), run_forever()\n"
+        "  TZ, MARKET_OPEN, MARKET_CLOSE\n"
+    )
+    # If launched with `python -i`, don't start the loop automatically
     if hasattr(sys, 'ps1') or sys.flags.interactive:
         print("Interactive shell detected. Scheduler not started automatically.")
     else:

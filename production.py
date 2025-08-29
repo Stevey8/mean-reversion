@@ -107,7 +107,7 @@ def split_4types(df_prepped,split_type):
         X_test = X.copy()['2023-01-01':]
         y_test = y.copy()['2023-01-01':]
     elif split_type == 3:
-        # less data but has at least 5 years of data up to 2025-06-30
+        # less data but has at least 5 years of data up to 2025-07-01
         # train exactly 5 years of data, test rest
         train_end = X.index.min() + pd.DateOffset(years=5)
         test_start = train_end + pd.DateOffset(days=1)
@@ -178,26 +178,26 @@ def update_data_pkl(
     )
 
     ls_sp500 = df_global_candidates['ticker'].tolist()
-    ls_global_candidates = df_global_candidates.loc[
+    use_in_global_tickers = df_global_candidates.loc[
         df_global_candidates['selected'], 'ticker'
     ].tolist()
 
     # make sure everything is lowercase 
-    ls_sp500 = [i.lower() for i in ls_sp500]
-    ls_global_candidates = [i.lower() for i in ls_global_candidates]
-    watchlist = [i.lower() for i in watchlist]
+    # ls_sp500 = [i.lower() for i in ls_sp500]
+    # use_in_global_tickers = [i.lower() for i in use_in_global_tickers]
+    # watchlist = [i.lower() for i in watchlist]
 
     if include_all_sp500_in_watchlist:
         watchlist = list(set(watchlist + ls_sp500))
     else: # only the selected ones (essential for global model)
-        watchlist = list(set(watchlist + ls_global_candidates))
+        watchlist = list(set(watchlist + use_in_global_tickers))
         
     print(f"total number of tickers to process: {len(watchlist)}")
 
 
     any_update = False
     # only update the data specifried by watchlist; keep existing
-    with tqdm(watchlist, desc="Processing tickers", leave=True) as pbar:
+    with tqdm(watchlist, desc="Processing tickers (data.pkl)", leave=True) as pbar:
         for i in pbar:
             # always show which ticker we're touching
             pbar.set_postfix_str(f"Last: {i}")
@@ -224,14 +224,14 @@ def update_data_pkl(
 
                     since = ohlcv.index.min().date()
                     sector = prepped['sector'].iloc[0]
-                    use_in_global = i in ls_global_candidates
+                    use_in_global = i in use_in_global_tickers
                 
                     # split type and split data 
                     if use_in_global:
-                        split_type = 1 # use in global model
+                        split_type = 1  # use in global model
                     elif since < datetime.strptime("2018-01-01", "%Y-%m-%d").date():
                         split_type = 2  # train up to 2022-12-31 and rest is test
-                    elif since < datetime.strptime("2020-06-30", "%Y-%m-%d").date():
+                    elif since < datetime.strptime("2020-07-01", "%Y-%m-%d").date():
                         split_type = 3  # use exactly 5yrs of data as train and rest is test
                     else: 
                         split_type = 4 # no sufficient data, do not split
@@ -311,9 +311,9 @@ def update_data_pkl(
                     if (
                         reselect_global_candidates 
                         and data[i]['split_type'] in (1,2)
-                        and (i in ls_global_candidates) != data[i]['use_in_global']
+                        and (i in use_in_global_tickers) != data[i]['use_in_global']
                     ):
-                        use_in_global = i in ls_global_candidates
+                        use_in_global = i in use_in_global_tickers
                         data[i]['use_in_global'] = use_in_global
                         if use_in_global:
                             split_type = 1
@@ -329,9 +329,33 @@ def update_data_pkl(
                     del data[i]
                 continue
 
+
+    # check split types (especially for 1 and 2)
+    print('Checking split types...')
+    for k,v in data.items():
+        if k in use_in_global_tickers:
+            if v['split_type'] != 1:
+                any_update = True
+                data[k]['split_type'] = 1
+                data[k]['split'] = split_4types(data[k]['prepped'],1)
+        else:
+            if v['split_type'] == 1:
+                any_update = True
+                min_date = v['since']
+                if min_date < datetime.strptime("2018-01-01", "%Y-%m-%d").date():
+                    split_type = 2  # train up to 2022-12-31 and rest is test
+                elif since < datetime.strptime("2020-07-01", "%Y-%m-%d").date():
+                    split_type = 3  # use exactly 5yrs of data as train and rest is test
+                else: 
+                    split_type = 4 # no sufficient data, do not split
+                data[k]['split_type'] = split_type
+                data[k]['split'] = split_4types(data[k]['prepped'],split_type)
+
     if any_update:
         print('data done. saving...')
         save_pkl(path, data)
+    else: 
+        print('nothing to update.')
     return data
 
 
@@ -344,6 +368,7 @@ def update_data_pkl(
 # ===================================
 def update_models_pkl(
         watchlist = watchlist, # indiv models trained based on this
+        end_date = None,
         models = None,
         data = None,
         update_data = True, # new data comes in everyday
@@ -352,18 +377,22 @@ def update_models_pkl(
         update_indiv_fullset = True, # new data comes in everyday
         update_stack = False, # frozen
         update_backtest = True,
+        update_all = False,
         reselect_global_candidates = False,
         redo = False,
         models_path = 'files/models.pkl',
         data_path = 'files/data.pkl',
         metrics_path = 'files/metrics.pkl',
+        global_candidates_path = "files/df_global_candidates.pkl",
 ):
+    if end_date is None:
+        end_date = get_available_date()
     if models is None:
         models = read_pkl(models_path, redo=redo)
     for i in ['global', 'indiv_trainset', 'indiv_fullset']:
         if i not in models:
             models[i] = {}
-    if redo: 
+    if redo or update_all: 
         update_global = True
         update_indiv = True
         update_indiv_fullset = True
@@ -377,6 +406,7 @@ def update_models_pkl(
             print('updating data...')
             data = update_data_pkl(
                 watchlist = watchlist,
+                end_date=end_date,
                 reselect_global_candidates=reselect_global_candidates
             )
         else: 
@@ -384,10 +414,14 @@ def update_models_pkl(
             data = read_pkl(data_path, redo=False)
 
     # retain a copy of global tickers
-    use_in_global_tickers = []
-    for k,v in data.items():
-        if v.get('use_in_global', False):
-            use_in_global_tickers.append(k)
+    df_global_candidates = read_pkl(global_candidates_path, redo=False)
+    use_in_global_tickers = df_global_candidates.loc[
+        df_global_candidates['selected'], 'ticker'
+    ].tolist()
+
+    # make sure everything is lowercase 
+    # use_in_global_tickers = [i.lower() for i in use_in_global_tickers]
+    # watchlist = [i.lower() for i in watchlist]
 
     watchlist = list(set(watchlist + use_in_global_tickers))
 
@@ -489,9 +523,7 @@ def update_models_pkl(
                 raise ValueError(f"Please train indiv model for {t} before training stack model")
             if any([
                 data[t]['split']['X_val'] is None,
-                data[t]['split']['X_val'].empty,
                 data[t]['split']['y_val'] is None,
-                data[t]['split']['y_val'].empty,
             ]):
                 raise ValueError(f"Please make sure {t} has a validation set before training stack model")
             # if models['indiv_trainset'][t]['as_of'] != models['global']['as_of']:
@@ -618,8 +650,6 @@ def update_models_pkl(
 def check_backtest(tickers: Iterable[str] = None, metrics_path = 'files/metrics.pkl'):
     if os.path.exists(metrics_path):
         metrics = read_pkl(metrics_path, redo=False)
-        if tickers is None: # or not none
-            ...
         if metrics:
             df_metrics = pd.DataFrame(metrics['backtested']).T
             df_metrics = df_metrics.rename(columns={
@@ -641,9 +671,10 @@ def check_backtest(tickers: Iterable[str] = None, metrics_path = 'files/metrics.
             print("cat legend:\n"
                   "1 = used in global and stack; stacked results from indiv (trained with 5+ years) & global (in-sample); complete test set starting 2023-01-01\n"
                   "2 = not used in global; stacked results from indiv (trained with 5+ years) & global (out-of-sample); complete test set starting 2023-01-01\n"
-                  "3 = not used in global; stacked results from indiv (trained with 5 years) & global (out-of-sample); shortened test set\n"
+                  "3 = not used in global; stacked results from indiv (trained with 5 years) & global (out-of-sample); shortened test set"
             )
             print(f"cat 4 aka skipped tickers due to insufficient data: {metrics.get('skipped', [])}")
+            print('')
             print(f"backtest config: {metrics.get('backtest_config', {})}")
         else:
             print("No metrics found in metrics.pkl")
@@ -660,6 +691,7 @@ def check_backtest(tickers: Iterable[str] = None, metrics_path = 'files/metrics.
 
 def run_pred(
         watchlist = watchlist,
+        include_global_tickers = True,
         data = None, 
         models = None, 
         metrics = None,
@@ -667,10 +699,24 @@ def run_pred(
         cutoff = 0.5,
         # date = None, # right now only run the last available row of data only
         models_path = "files/models.pkl",
-        metrics_path = "files/metrics.pkl"
+        metrics_path = "files/metrics.pkl",
+        global_candidates_path = "files/df_global_candidates.pkl"
 ):
+
+    if include_global_tickers: 
+        df_global_candidates = read_pkl(global_candidates_path, redo=False)
+        use_in_global_tickers = df_global_candidates.loc[
+            df_global_candidates['selected'], 'ticker'
+        ].tolist()
+
+        # make sure everything is lowercase 
+        # use_in_global_tickers = [i.lower() for i in use_in_global_tickers]
+        # watchlist = [i.lower() for i in watchlist]
+
+        watchlist = list(set(watchlist + use_in_global_tickers))
+
     if data is None: 
-        data = update_data_pkl() # always update data 
+        data = update_data_pkl(watchlist = watchlist) # always update data 
     if models is None: 
         models = read_pkl(models_path, redo=False)
     if metrics is None: 
@@ -694,12 +740,12 @@ def run_pred(
             proba_gonly = model.predict_proba(to_pred)[:, 1]
             results.append({
                 'ticker': t,
-                'proba_sfull': None,
-                'proba_strain': None,
                 'proba_g': proba_gonly[0],
-                'proba_ifull': None,
+                'proba_strain': None,
                 'proba_itrain': None,
-                'cat': 4,
+                'proba_sfull': None,
+                'proba_ifull': None,
+                'cat': '4',
             })
         else:
             model_global = models['global']['model']
@@ -719,33 +765,38 @@ def run_pred(
             }, index=to_pred.index))[:, 1]
             results.append({
                 'ticker': t,
-                'proba_sfull': proba_sfull[0],
-                'proba_strain': proba_strain[0],
                 'proba_g': proba_g[0],
-                'proba_ifull': proba_ifull[0],
+                'proba_strain': proba_strain[0],
                 'proba_itrain': proba_itrain[0],
-                'cat': data[t]['split_type'],
+                'proba_sfull': proba_sfull[0],
+                'proba_ifull': proba_ifull[0],
+                'cat': str(data[t]['split_type']),
             })
-    df_results = pd.DataFrame(results).set_index('ticker').sort_values(by='proba_sfull', ascending=False)
+    df_results = pd.DataFrame(results).set_index('ticker').sort_values(by='proba_g', ascending=False)
 
     if ls_data_not_available:
         print(f"Data not available for the following tickers: {', '.join(ls_data_not_available)}")
     if len(d_pred_date) == 1:
-        print(f"prediction of data on {list(d_pred_date.keys())[0]}")
+        print(f"prediction of data on {list(d_pred_date.keys())[0].date()}")
     else: 
         print('inconsistent data dates:')
         print(d_pred_date)
 
     if show_all:
         print(tabulate(df_results, headers='keys', tablefmt='psql', floatfmt=".4f"))
-        print("please check individual backtest result by calling check_backtest([tickers])")
+        print("show backtest results for the top 20 tickers")
+        print("for other tickers please check calling check_backtest(tickers)")
+        tickers = df_results.head(20).index.tolist()
     else: 
-        proba_cols = ["proba_sfull", "proba_strain", "proba_g", "proba_ifull", "proba_itrain"]
-        df_filtered = df_results[(df_results[proba_cols] >= cutoff).all(axis=1)]
+        proba_cols = [ "proba_g", "proba_strain", "proba_itrain", "proba_sfull", "proba_ifull"]
+        df_filtered = df_results[
+            (df_results[proba_cols].ge(cutoff) | df_results[proba_cols].isna()).all(axis=1)
+        ]
         print(tabulate(df_filtered, headers='keys', tablefmt='psql', floatfmt=".4f"))
-        tickers = df_filtered.index.tolist()
-        print("\n" + "="*20 + " BACKTEST RESULTS " + "="*20)
-        print("╔" + "═"*58 + "╗")
-        print("║{:^58s}║".format("BACKTEST SUMMARY"))
-        print("╚" + "═"*58 + "╝\n")
-        check_backtest(tickers)
+        tickers = df_filtered.index.tolist() 
+
+    print("\n" + "="*20 + " BACKTEST RESULTS " + "="*20)
+    print("╔" + "═"*58 + "╗")
+    print("║{:^58s}║".format("BACKTEST SUMMARY"))
+    print("╚" + "═"*58 + "╝\n")
+    check_backtest(tickers)

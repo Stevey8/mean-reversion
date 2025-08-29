@@ -13,6 +13,9 @@ logs/
 results/
 .vscode/
 files/
+metadata/
+trades/
+archive/
 
 models/
 *.h5

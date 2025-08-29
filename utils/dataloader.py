@@ -92,7 +92,7 @@ def get_sp500(
     redo: bool = False,
     *,
     url: str = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-    excluded: Iterable[str] = ("GOOG", "FOXA", "NWS"),  # adjust as needed
+    excluded: Iterable[str] = ("GOOG", "FOXA", "NWS", "WBA"),  # adjust as needed
     lowercase: bool = True,
     cache_min_count: int = 490,  # accept cached list if it's reasonably complete
 ) -> List[str]:
@@ -105,6 +105,7 @@ def get_sp500(
     - Wikipedia can change; this scrapes the first table with a 'Symbol' column.
     - Some providers use '-' instead of '.' for class shares (e.g., BRK.B -> BRK-B).
     - `excluded` lets you drop alternates (e.g., GOOG vs GOOGL) if desired.
+    - 2025-08-25: IBKR replaced WBA 
     """
 
     # Try cache first unless forced refresh
@@ -245,7 +246,7 @@ def get_sp500_tickers_sectors_mindates(
 def select_global_candidates(
     info: pd.DataFrame | None = None,
     min_date: str = '2016-01-01',
-    n: int = 8,  # sample n tickers per sector
+    n: int = 10,  # sample n tickers per sector
     path: str = 'files/df_global_candidates.pkl',
     redo: bool = False,
 ) -> pd.DataFrame:
